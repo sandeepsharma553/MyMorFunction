@@ -111,8 +111,7 @@ exports.sendVerificationCode = functions.https.onRequest(async (req, res) => {
   }
 });
 
-exports.sendGroupMessageNotification = functions.database
-    .ref("/messages/{groupId}/{messageId}")
+exports.sendGroupMessageNotification = functions.database.onValueCreated("/messages/{groupId}/{messageId}")
     .onCreate(async (snapshot, context) => {
       const messageData = snapshot.val();
       const senderId = messageData.senderId;
