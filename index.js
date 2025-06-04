@@ -1,5 +1,8 @@
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
+const {onValueCreated} = require("firebase-functions/v2/database");
+const {getDatabase} = require("firebase-admin/database");
+const {getMessaging} = require("firebase-admin/messaging");
 admin.initializeApp();
 
 // const sgMail = require("@sendgrid/mail");
@@ -94,12 +97,14 @@ exports.sendVerificationCode = functions.https.onRequest(async (req, res) => {
         code,
         expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes from now
       });
+
   const msg = {
     to: email,
     from: "chiggy14@gmaill.com", // Replace with verified sender
     subject: "Your Verification Code",
     text: `Your verification code is ${code}`,
   };
+
   try {
     // await sgMail.send(msg);
     await transporter.sendMail(msg);
@@ -111,31 +116,36 @@ exports.sendVerificationCode = functions.https.onRequest(async (req, res) => {
   }
 });
 
-exports.sendGroupMessageNotification = functions.database.onValueCreated("/messages/{groupId}/{messageId}")
-    .onCreate(async (snapshot, context) => {
-      const messageData = snapshot.val();
-      const senderId = messageData.senderId;
+exports.sendGroupMessageNotification = onValueCreated("/messages/{groupId}/{messageId}", async (event) => {
+  const snapshot = event.data;
+  const messageData = snapshot.val();
 
-      // Fetch tokens of all users (excluding sender)
-      const tokensSnap = await admin.database().ref("/userTokens").once("value");
-      const tokens = [];
+  const senderId = messageData.senderId;
+  const senderName = messageData.sender || "Someone";
+  const messageText = messageData.text || "";
 
-      tokensSnap.forEach((child) => {
-        if (child.key !== senderId) {
-          tokens.push(child.val());
-        }
-      });
+  const db = getDatabase();
+  const tokensSnap = await db.ref("/userTokens").once("value");
 
-      const payload = {
-        notification: {
-          title: "New Group Message",
-          body: `${messageData.sender}: ${messageData.text}`,
-        },
-      };
+  const tokens = [];
+  tokensSnap.forEach((child) => {
+    if (child.key !== senderId && child.val()) {
+      tokens.push(child.val());
+    }
+  });
 
-      if (tokens.length > 0) {
-        return admin.messaging().sendToDevice(tokens, payload);
-      }
+  if (tokens.length === 0) {
+    console.log("No tokens found");
+    return null;
+  }
 
-      return null;
-    });
+  const payload = {
+    notification: {
+      title: "New Group Message",
+      body: `${senderName}: ${messageText}`,
+    },
+  };
+
+  const messaging = getMessaging();
+  return messaging.sendToDevice(tokens, payload);
+});
