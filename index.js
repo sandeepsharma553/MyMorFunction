@@ -2,8 +2,8 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const {onValueCreated} = require("firebase-functions/v2/database");
 const {getDatabase} = require("firebase-admin/database");
-const {getMessaging} = require("firebase-admin/messaging");
 admin.initializeApp();
+
 
 // const sgMail = require("@sendgrid/mail");
 // sgMail.setApiKey(functions.remoteConfig().sendgrid.key); // Replace this
@@ -116,10 +116,12 @@ exports.sendVerificationCode = functions.https.onRequest(async (req, res) => {
   }
 });
 
+
 exports.sendGroupMessageNotification = onValueCreated("/messages/{groupId}/{messageId}", async (event) => {
   const snapshot = event.data;
   const messageData = snapshot.val();
 
+  const groupName = messageData.groupName;
   const senderId = messageData.senderId;
   const senderName = messageData.sender || "Someone";
   const messageText = messageData.text || "";
@@ -141,11 +143,24 @@ exports.sendGroupMessageNotification = onValueCreated("/messages/{groupId}/{mess
 
   const payload = {
     notification: {
-      title: "New Group Message",
+      title: groupName,
       body: `${senderName}: ${messageText}`,
     },
   };
 
-  const messaging = getMessaging();
-  return messaging.sendToDevice(tokens, payload);
+  // const messaging = getMessaging();
+  // return messaging.sendToDevice(tokens, payload);
+  const multicastMessage = {
+    tokens: tokens, // array of registration tokens (FCM tokens)
+    ...payload,
+  };
+
+  try {
+    const response = await admin.messaging().sendEachForMulticast(multicastMessage);
+    console.log(`${response.successCount} messages were sent successfully`);
+    return response;
+  } catch (error) {
+    console.error("Error sending FCM:", error);
+    return null;
+  }
 });
