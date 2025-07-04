@@ -2,6 +2,7 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const {onValueCreated} = require("firebase-functions/v2/database");
 const {getDatabase} = require("firebase-admin/database");
+const cors = require("cors")({origin: true});
 admin.initializeApp();
 const db = getDatabase();
 
@@ -404,3 +405,35 @@ exports.sendCommunityReplyNotification = onValueCreated(
     },
 );
 
+exports.deleteUserByUid = functions.https.onRequest(
+    (req, res) => {
+      cors(req, res, async () => {
+        try {
+          if (req.method !== "POST") {
+            return res
+                .status(405)
+                .json({error: "Method Not Allowed. Use POST."});
+          }
+
+          const {uid} = req.body || {};
+          console.log(req,'req')
+          if (typeof uid !== "string" || !uid.trim()) {
+            return res
+                .status(400)
+                .json({error: "Request body must contain { uid: <string> }"});
+          }
+          await admin.auth().deleteUser(uid);
+          return res
+              .status(200)
+              .json({success: true, message: `User ${uid} deleted.`});
+        } catch (err) {
+          console.error("deleteUserByUid:", err);
+          if (err.code === "auth/user-not-found") {
+            return res.status(404).json({error: "User not found"});
+          }
+
+          return res.status(500).json({error: err.message});
+        }
+      });
+    },
+);
