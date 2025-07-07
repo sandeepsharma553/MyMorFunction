@@ -119,6 +119,7 @@ exports.sendVerificationCode = functions.https.onRequest(async (req, res) => {
 
 
 exports.sendGroupMessageNotification = onValueCreated("/messages/{groupId}/{messageId}", async (event) => {
+  const {groupId} = event.params;
   const snapshot = event.data;
   const messageData = snapshot.val();
 
@@ -126,6 +127,8 @@ exports.sendGroupMessageNotification = onValueCreated("/messages/{groupId}/{mess
   const senderId = messageData.senderId;
   const senderName = messageData.sender || "Someone";
   const messageText = messageData.text || "";
+  const type = messageData.type || "";
+  const posterUrl = messageData.posterUrl || "";
 
 
   const tokensSnap = await db.ref("/userTokens").once("value");
@@ -141,11 +144,38 @@ exports.sendGroupMessageNotification = onValueCreated("/messages/{groupId}/{mess
     console.log("No tokens found");
     return null;
   }
-
+  const body =
+    !type || type === "text" ?
+      `${senderName}: ${messageText || "Sent a message"}` :
+      `${senderName} ${{
+        image: "sent an image",
+        audio: "sent a voice message",
+        video: "sent a video",
+        event: "created an event",
+        poll: "created a poll",
+      }[type]
+      }`;
+  // const payload = {
+  //   notification: {
+  //     title: groupName,
+  //     body: `${senderName}: ${messageText}`,
+  //   },
+  // };
   const payload = {
     notification: {
       title: groupName,
-      body: `${senderName}: ${messageText}`,
+      body: body,
+    },
+    data: {
+      screen: "GroupChat",
+      type: "groupMessage",
+      groupId,
+      groupName,
+      senderId,
+      senderName,
+      messageType: type,
+      messageText,
+      posterUrl,
     },
   };
 
@@ -195,7 +225,13 @@ exports.sendAnnouncementsCommentNotification = onValueCreated(
           body: `${senderName}: ${messageText}`,
         },
         data: {
-          announcementId: announcementId,
+          screen: "AnnouncementDetail",
+          announcementId,
+          title,
+          senderId,
+          senderName,
+          messageText,
+          announcement,
         },
       };
       const multicastMessage = {
@@ -244,7 +280,13 @@ exports.sendAnnouncementsReplyNotification = onValueCreated(
           body: `${senderName}: ${messageText}`,
         },
         data: {
+          screen: "AnnouncementDetail",
           announcementId,
+          title,
+          senderId,
+          senderName,
+          messageText,
+          comment,
           commentId,
         },
       };
@@ -288,6 +330,7 @@ exports.sendCommunitynNewPostNotification = onValueCreated(
           body: `${senderName}: ${messageText.slice(0, 100)}`,
         },
         data: {
+          screen: "Community",
           postId,
           type: "new_post",
         },
@@ -335,6 +378,7 @@ exports.sendCommunityCommentNotification = onValueCreated(
           body: `${senderName}: ${messageText}`,
         },
         data: {
+          screen: "Community",
           postId,
           type: "comment",
         },
@@ -385,6 +429,7 @@ exports.sendCommunityReplyNotification = onValueCreated(
           body: `${senderName}: ${messageText}`,
         },
         data: {
+          screen: "Community",
           postId,
           commentId,
           type: "reply",
@@ -416,7 +461,7 @@ exports.deleteUserByUid = functions.https.onRequest(
           }
 
           const {uid} = req.body || {};
-          console.log(req,'req')
+          console.log(req, "req");
           if (typeof uid !== "string" || !uid.trim()) {
             return res
                 .status(400)
