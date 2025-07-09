@@ -219,6 +219,12 @@ exports.sendAnnouncementsCommentNotification = onValueCreated(
       });
       if (!tokens) return null;
 
+      const safeAnnouncement = {
+        id: announcementId,
+        title: announcement.title || "",
+        description: announcement.description || "",
+      };
+      console.log(safeAnnouncement, "announcement");
       const payload = {
         notification: {
           title: title,
@@ -231,7 +237,6 @@ exports.sendAnnouncementsCommentNotification = onValueCreated(
           senderId,
           senderName,
           messageText,
-          announcement,
         },
       };
       const multicastMessage = {
@@ -286,7 +291,6 @@ exports.sendAnnouncementsReplyNotification = onValueCreated(
           senderId,
           senderName,
           messageText,
-          comment,
           commentId,
         },
       };
