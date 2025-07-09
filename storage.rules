@@ -1,0 +1,16 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isAdmin(){
+      return request.auth!=null && request.auth.uid=='1CaaC8W1ZxgZDj3zJsRUDl1FFTj1';
+    }
+    match /{allPaths=**} {
+      allow read, create: if request.auth!=null;
+      allow delete: if isAdmin();
+    }
+    
+    match /chat_media/{all=**} {
+    	allow create, read;
+    }
+  }
+}
