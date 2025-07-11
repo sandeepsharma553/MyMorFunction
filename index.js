@@ -540,3 +540,46 @@ exports.sendMenuUpdateNotification = onDocumentUpdated("menus/{menuDate}", async
   }
 },
 );
+exports.sendAnnouncementsNewNotification = onValueCreated("/announcements/{announcementId}", async (event) => {
+  const data = event.data.val();
+  const senderId = data.uid;
+  const senderName = data.user || "Someone";
+  const messageText = data.title || "New announcement";
+
+  // Skip notifying the sender
+  const tokensSnap = await db.ref("/userTokens").once("value");
+  const tokens = [];
+  tokensSnap.forEach((child) => {
+    if (child.key !== senderId && child.val()) {
+      tokens.push(child.val());
+    }
+  });
+
+  if (!tokens.length) return;
+
+  const payload = {
+    notification: {
+      title: "New Announcement",
+      body: `${senderName}: ${messageText}`,
+    },
+    data: {
+      screen: "AnnouncementDetail",
+      type: "new_announcement",
+      title: data.title,
+      announcementId: event.params.announcementId,
+    },
+  };
+
+  try {
+    const response = await admin.messaging().sendEachForMulticast({
+      tokens,
+      ...payload,
+    });
+    console.log(`${response.successCount} notifications sent.`);
+    return response;
+  } catch (error) {
+    console.error("Error sending notification:", error);
+    return null;
+  }
+},
+);
