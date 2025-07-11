@@ -1,6 +1,7 @@
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const {onValueCreated} = require("firebase-functions/v2/database");
+const {onDocumentUpdated} = require("firebase-functions/v2/firestore");
 const {getDatabase} = require("firebase-admin/database");
 const cors = require("cors")({origin: true});
 admin.initializeApp();
@@ -485,4 +486,57 @@ exports.deleteUserByUid = functions.https.onRequest(
         }
       });
     },
+);
+exports.sendMenuUpdateNotification = onDocumentUpdated("menus/{menuDate}", async (event) => {
+  const menuDate = event.params.menuDate;
+  const beforeData = event.data.before.data();
+  const afterData = event.data.after.data();
+
+  // Avoid duplicate notification if no actual change
+  if (JSON.stringify(beforeData) === JSON.stringify(afterData)) {
+    console.log("No actual changes in the menu. Skipping notification.");
+    return;
+  }
+
+  const db = admin.database();
+  const tokensSnap = await db.ref("/userTokens").once("value");
+
+  const tokens = [];
+  tokensSnap.forEach((child) => {
+    if (child.val()) {
+      tokens.push(child.val());
+    }
+  });
+
+  if (!tokens.length) {
+    console.log("No FCM tokens found");
+    return null;
+  }
+
+  const payload = {
+    notification: {
+      title: "Dining Menu Updated",
+      body: `The menu for ${menuDate} has been updated. Check it out!`,
+    },
+    data: {
+      screen: "DiningMenu",
+      type: "menuUpdate",
+      menuDate: menuDate,
+    },
+  };
+
+  const multicastMessage = {
+    tokens,
+    ...payload,
+  };
+
+  try {
+    const response = await admin.messaging().sendEachForMulticast(multicastMessage);
+    console.log(`${response.successCount} menu notifications sent successfully.`);
+    return response;
+  } catch (error) {
+    console.error("Error sending menu update notification:", error);
+    return null;
+  }
+},
 );
