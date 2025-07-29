@@ -583,3 +583,53 @@ exports.sendAnnouncementsNewNotification = onValueCreated("/announcements/{annou
   }
 },
 );
+exports.disableUserByUid = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      if (req.method !== "POST") {
+        return res
+            .status(405)
+            .json({error: "Method Not Allowed. Use POST."});
+      }
+
+      const {uid} = req.body;
+      if (!uid || typeof uid !== "string") {
+        return res
+            .status(400)
+            .json({error: "Request body must contain { uid: <string> }"});
+      }
+
+      await admin.auth().updateUser(uid, {disabled: true});
+
+      return res.status(200).json({success: true});
+    } catch (err) {
+      console.error("disableUserByUid error:", err);
+      return res.status(500).json({error: err.message});
+    }
+  });
+});
+exports.enableUserByUid = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      if (req.method !== "POST") {
+        return res
+            .status(405)
+            .json({error: "Method Not Allowed. Use POST."});
+      }
+
+      const {uid} = req.body;
+      if (!uid || typeof uid !== "string") {
+        return res
+            .status(400)
+            .json({error: "Request body must contain { uid: <string> }"});
+      }
+
+      await admin.auth().updateUser(uid, {disabled: false});
+
+      return res.status(200).json({success: true});
+    } catch (err) {
+      console.error("enableUserByUid error:", err);
+      return res.status(500).json({error: err.message});
+    }
+  });
+});
