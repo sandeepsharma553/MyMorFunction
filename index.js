@@ -586,10 +586,12 @@ exports.enableUserByUid = functions.https.onRequest((req, res) => {
   });
 });
 
-// ===== helpers =====
+/* ================== DISABLE / ENABLE HOSTEL (doc.id === Auth UID) ================== */
+/* eslint-disable no-console */
+
 const EMP_COLLECTION = "employees";
 
-// ==== helpers ====
+// ---------- helpers ----------
 function chunk(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -603,21 +605,41 @@ function norm(val) {
 
 function isSuperadminDoc(d) {
   d = d || {};
-  const cand = [d.role, d.type, d.userRole, d.user_type];
-  if (cand.some(v => norm(v) === "superadmin")) return true;
-  if (Array.isArray(d.roles) && d.roles.some(x => norm(x) === "superadmin")) return true;
+  var cand = [d.role, d.type, d.userRole, d.user_type];
+  for (var i = 0; i < cand.length; i++) {
+    if (norm(cand[i]) === "superadmin") return true;
+  }
+  if (Array.isArray(d.roles)) {
+    for (var j = 0; j < d.roles.length; j++) {
+      if (norm(d.roles[j]) === "superadmin") return true;
+    }
+  }
   if (d.roles && typeof d.roles === "object" && !Array.isArray(d.roles)) {
-    for (const [k, v] of Object.entries(d.roles)) if (norm(k) === "superadmin" && !!v) return true;
+    for (var k in d.roles) {
+      if (Object.prototype.hasOwnProperty.call(d.roles, k)) {
+        if (norm(k) === "superadmin" && !!d.roles[k]) return true;
+      }
+    }
   }
   if (d.isSuperadmin === true || d.is_superadmin === true) return true;
   return false;
 }
 
-function isSuperadminClaims(claims = {}) {
+function isSuperadminClaims(claims) {
+  claims = claims || {};
   if (norm(claims.role) === "superadmin" || norm(claims.type) === "superadmin") return true;
-  if (Array.isArray(claims.roles) && claims.roles.some(x => norm(x) === "superadmin")) return true;
+
+  if (Array.isArray(claims.roles)) {
+    for (var i = 0; i < claims.roles.length; i++) {
+      if (norm(claims.roles[i]) === "superadmin") return true;
+    }
+  }
   if (claims.roles && typeof claims.roles === "object" && !Array.isArray(claims.roles)) {
-    for (const [k, v] of Object.entries(claims.roles)) if (norm(k) === "superadmin" && !!v) return true;
+    for (var k in claims.roles) {
+      if (Object.prototype.hasOwnProperty.call(claims.roles, k)) {
+        if (norm(k) === "superadmin" && !!claims.roles[k]) return true;
+      }
+    }
   }
   if (claims.isSuperadmin === true || claims.is_superadmin === true) return true;
   return false;
@@ -629,39 +651,72 @@ async function findSuperadminUIDsByClaims(uids) {
 
   for (const group of chunk(uids, 50)) {
     const users = await Promise.all(
-      group.map(async (uid) => {
-        try {
-          return await auth.getUser(uid);
-        } catch (e) {
-          return null;
-        }
+      group.map(function (uid) {
+        return auth.getUser(uid).then(
+          function (u) { return u; },
+          function () { return null; }
+        );
       })
     );
-
-    users.forEach((u) => {
+    users.forEach(function (u) {
       if (u && isSuperadminClaims(u.customClaims || {})) {
         result.add(u.uid);
       }
     });
-
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise(function (r) { setTimeout(r, 100); });
   }
-
   return result;
 }
 
-
 function toUidSet(arr) {
   if (!Array.isArray(arr)) return new Set();
-  return new Set(arr.map(x => String(x).trim()).filter(Boolean));
+  return new Set(arr.map(function (x) { return String(x).trim(); }).filter(Boolean));
 }
 
-exports.disableHostelAndLockEmployees = functions.https.onRequest((req, res) => {
-  cors(req, res, async () => {
+// Collect employees linked to a hostel across common schema variants
+async function collectEmployeesForHostel(hostelid) {
+  const col = fsdb.collection(EMP_COLLECTION);
+  const hostRef = fsdb.collection("hostel").doc(hostelid);
+
+  const seen = new Set();
+  const docs = [];
+
+  async function run(q) {
+    try {
+      const snap = await q.get();
+      snap.forEach(function (d) {
+        const key = d.ref.path;
+        if (!seen.has(key)) {
+          seen.add(key);
+          docs.push(d);
+        }
+      });
+    } catch (e) {
+      console.warn("collectEmployeesForHostel query skipped:", e && e.message ? e.message : String(e));
+    }
+  }
+
+  await run(col.where("hostelid", "==", hostelid));
+  await run(col.where("hostelId", "==", hostelid));
+  await run(col.where("hostel_id", "==", hostelid));
+  await run(col.where("hostelIds", "array-contains", hostelid));
+  await run(col.where("hostel.id", "==", hostelid));
+  await run(col.where("hostelRef", "==", hostRef));
+
+  return docs;
+}
+
+// ---------- endpoints (v1) ----------
+exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req, res) {
+  cors(req, res, async function () {
     try {
       if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed. Use POST." });
 
-      const { hostelid, reason = "Disabled by admin action", excludeUids = [] } = req.body || {};
+      const body = req.body || {};
+      const hostelid = body.hostelid;
+      const reason = body.reason || "Disabled by admin action";
+      const excludeUids = Array.isArray(body.excludeUids) ? body.excludeUids : [];
+
       if (!hostelid || typeof hostelid !== "string") {
         return res.status(400).json({ error: "Request must include { hostelid: <string> }" });
       }
@@ -670,92 +725,114 @@ exports.disableHostelAndLockEmployees = functions.https.onRequest((req, res) => 
       const skipUidSet = toUidSet(excludeUids);
 
       // 1) Mark hostel disabled
-      await fsdb.collection("hostel").doc(hostelid).set({
-        active: false,
-        lockedAt: FieldValue.serverTimestamp(),
-        lockedBy: "http",
-        disabledReason: reason,
-      }, { merge: true });
+      await fsdb.collection("hostel").doc(hostelid).set(
+        {
+          active: false,
+          lockedAt: FieldValue.serverTimestamp(),
+          lockedBy: "http",
+          disabledReason: reason
+        },
+        { merge: true }
+      );
 
-      // 2) Collect employees (skip superadmin + skipUidSet)
-      const qSnap = await fsdb.collection(EMP_COLLECTION).where("hostelid", "==", hostelid).get();
+      // 2) Collect employees
+      let empDocs = await collectEmployeesForHostel(hostelid);
 
-      let empDocs = [];
+      // Build uid list from DOC IDs (doc.id === Auth UID)
       let uids = [];
       let skippedSuperadmins = 0;
       let skippedByUid = 0;
 
-      qSnap.forEach(docSnap => {
+      empDocs = empDocs.filter(function (docSnap) {
         const d = docSnap.data() || {};
-        const duid = d.uid ? String(d.uid) : null;
+        const duid = String(docSnap.id); // <-- use doc id as UID
 
-        if (duid && skipUidSet.has(duid)) { skippedByUid++; return; }
-        if (isSuperadminDoc(d)) { skippedSuperadmins++; return; }
+        if (skipUidSet.has(duid)) { skippedByUid++; return false; }
+        if (isSuperadminDoc(d))   { skippedSuperadmins++; return false; }
 
-        empDocs.push(docSnap);
-        if (duid) uids.push(duid);
+        uids.push(duid);
+        return true;
       });
 
-      // 2b) Claims superadmins → add to skip set too
+      // claims-level skip
       const claimSupers = await findSuperadminUIDsByClaims(uids);
       if (claimSupers.size) {
-        claimSupers.forEach(uid => skipUidSet.add(uid));
+        claimSupers.forEach(function (uid) { skipUidSet.add(uid); });
         skippedSuperadmins += claimSupers.size;
-        // filter out from both lists
-        empDocs = empDocs.filter(ds => {
-          const duid = (ds.data() || {}).uid;
-          return !duid || !skipUidSet.has(String(duid));
+
+        empDocs = empDocs.filter(function (ds) {
+          const duid2 = String(ds.id);
+          return !skipUidSet.has(duid2);
         });
-        uids = uids.filter(uid => !skipUidSet.has(String(uid)));
+        uids = uids.filter(function (uid) { return !skipUidSet.has(uid); });
       }
 
-      // 3) Firestore batched updates (only non-skipped)
+      // 3) Firestore batched updates
       let fsCount = 0;
       for (const group of chunk(empDocs, 450)) {
         const batch = fsdb.batch();
-        group.forEach(ds => {
-          batch.set(ds.ref, {
-            active: false,
-            lockedAt: FieldValue.serverTimestamp(),
-            lockedBy: "http",
-            lockedNote: reason,
-          }, { merge: true });
+        group.forEach(function (ds) {
+          batch.set(
+            ds.ref,
+            {
+              active: false,
+              lockedAt: FieldValue.serverTimestamp(),
+              lockedBy: "http",
+              lockedNote: reason
+            },
+            { merge: true }
+          );
         });
         await batch.commit();
         fsCount += group.length;
       }
 
-      // 4) Auth disable (only non-skipped)
+      // 4) Auth disable
       let authCount = 0;
       for (const group of chunk(uids, 50)) {
-        await Promise.all(group.map(async uid => {
-          try { await admin.auth().updateUser(uid, { disabled: true }); authCount++; }
-          catch (e) { console.error("Auth disable failed for", uid, e.message); }
-        }));
-        await new Promise(r => setTimeout(r, 150));
+        await Promise.all(
+          group.map(function (uid) {
+            return admin
+              .auth()
+              .updateUser(uid, { disabled: true })
+              .then(function () { authCount++; })
+              .catch(function (e) {
+                console.error("Auth disable failed for", uid, e && e.message ? e.message : String(e));
+              });
+          })
+        );
+        await new Promise(function (r) { setTimeout(r, 150); });
       }
+
+      console.log("[disableHostelAndLockEmployees]",
+        "hostel:", hostelid, "docs:", empDocs.length, "uids:", uids.length,
+        "skippedSuperadmins:", skippedSuperadmins, "skippedByUid:", skippedByUid);
 
       return res.status(200).json({
         success: true,
-        hostelid,
+        hostelid: hostelid,
         firestoreUpdatedEmployees: fsCount,
         authDisabledUsers: authCount,
-        skippedSuperadmins,
-        skippedByUid,
+        skippedSuperadmins: skippedSuperadmins,
+        skippedByUid: skippedByUid
       });
     } catch (err) {
-      console.error("disableHostelAndLockEmployees error:", err);
-      return res.status(500).json({ error: err.message });
+      console.error("disableHostelAndLockEmployees error:", err && err.message ? err.message : String(err));
+      return res.status(500).json({ error: err && err.message ? err.message : "Internal error" });
     }
   });
 });
 
-exports.enableHostelAndEmployees = functions.https.onRequest((req, res) => {
-  cors(req, res, async () => {
+exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res) {
+  cors(req, res, async function () {
     try {
       if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed. Use POST." });
 
-      const { hostelid, reason = "Enabled by admin action", excludeUids = [] } = req.body || {};
+      const body = req.body || {};
+      const hostelid = body.hostelid;
+      const reason = body.reason || "Enabled by admin action";
+      const excludeUids = Array.isArray(body.excludeUids) ? body.excludeUids : [];
+
       if (!hostelid || typeof hostelid !== "string") {
         return res.status(400).json({ error: "Request must include { hostelid: <string> }" });
       }
@@ -764,81 +841,99 @@ exports.enableHostelAndEmployees = functions.https.onRequest((req, res) => {
       const skipUidSet = toUidSet(excludeUids);
 
       // 1) Mark hostel enabled
-      await fsdb.collection("hostel").doc(hostelid).set({
-        active: true,
-        unlockedAt: FieldValue.serverTimestamp(),
-        unlockedBy: "http",
-        enabledReason: reason,
-      }, { merge: true });
+      await fsdb.collection("hostel").doc(hostelid).set(
+        {
+          active: true,
+          unlockedAt: FieldValue.serverTimestamp(),
+          unlockedBy: "http",
+          enabledReason: reason
+        },
+        { merge: true }
+      );
 
-      // 2) Collect employees (skip superadmin + skipUidSet)
-      const qSnap = await fsdb.collection(EMP_COLLECTION).where("hostelid", "==", hostelid).get();
+      // 2) Collect employees
+      let empDocs = await collectEmployeesForHostel(hostelid);
 
-      let empDocs = [];
       let uids = [];
       let skippedSuperadmins = 0;
       let skippedByUid = 0;
 
-      qSnap.forEach(docSnap => {
+      empDocs = empDocs.filter(function (docSnap) {
         const d = docSnap.data() || {};
-        const duid = d.uid ? String(d.uid) : null;
+        const duid = String(docSnap.id); // <-- use doc id as UID
 
-        if (duid && skipUidSet.has(duid)) { skippedByUid++; return; }
-        if (isSuperadminDoc(d)) { skippedSuperadmins++; return; }
+        if (skipUidSet.has(duid)) { skippedByUid++; return false; }
+        if (isSuperadminDoc(d))   { skippedSuperadmins++; return false; }
 
-        empDocs.push(docSnap);
-        if (duid) uids.push(duid);
+        uids.push(duid);
+        return true;
       });
 
-      // 2b) Claims superadmins → add to skip set too
       const claimSupers = await findSuperadminUIDsByClaims(uids);
       if (claimSupers.size) {
-        claimSupers.forEach(uid => skipUidSet.add(uid));
+        claimSupers.forEach(function (uid) { skipUidSet.add(uid); });
         skippedSuperadmins += claimSupers.size;
-        empDocs = empDocs.filter(ds => {
-          const duid = (ds.data() || {}).uid;
-          return !duid || !skipUidSet.has(String(duid));
+
+        empDocs = empDocs.filter(function (ds) {
+          const duid2 = String(ds.id);
+          return !skipUidSet.has(duid2);
         });
-        uids = uids.filter(uid => !skipUidSet.has(String(uid)));
+        uids = uids.filter(function (uid) { return !skipUidSet.has(uid); });
       }
 
-      // 3) Firestore batched updates (only non-skipped)
+      // 3) Firestore batched updates
       let fsCount = 0;
       for (const group of chunk(empDocs, 450)) {
         const batch = fsdb.batch();
-        group.forEach(ds => {
-          batch.set(ds.ref, {
-            active: true,
-            unlockedAt: FieldValue.serverTimestamp(),
-            unlockedBy: "http",
-            unlockedNote: reason,
-          }, { merge: true });
+        group.forEach(function (ds) {
+          batch.set(
+            ds.ref,
+            {
+              active: true,
+              unlockedAt: FieldValue.serverTimestamp(),
+              unlockedBy: "http",
+              unlockedNote: reason
+            },
+            { merge: true }
+          );
         });
         await batch.commit();
         fsCount += group.length;
       }
 
-      // 4) Auth enable (only non-skipped)
+      // 4) Auth enable
       let authCount = 0;
       for (const group of chunk(uids, 50)) {
-        await Promise.all(group.map(async uid => {
-          try { await admin.auth().updateUser(uid, { disabled: false }); authCount++; }
-          catch (e) { console.error("Auth enable failed for", uid, e.message); }
-        }));
-        await new Promise(r => setTimeout(r, 150));
+        await Promise.all(
+          group.map(function (uid) {
+            return admin
+              .auth()
+              .updateUser(uid, { disabled: false })
+              .then(function () { authCount++; })
+              .catch(function (e) {
+                console.error("Auth enable failed for", uid, e && e.message ? e.message : String(e));
+              });
+          })
+        );
+        await new Promise(function (r) { setTimeout(r, 150); });
       }
+
+      console.log("[enableHostelAndEmployees]",
+        "hostel:", hostelid, "docs:", empDocs.length, "uids:", uids.length,
+        "skippedSuperadmins:", skippedSuperadmins, "skippedByUid:", skippedByUid);
 
       return res.status(200).json({
         success: true,
-        hostelid,
+        hostelid: hostelid,
         firestoreUpdatedEmployees: fsCount,
         authEnabledUsers: authCount,
-        skippedSuperadmins,
-        skippedByUid,
+        skippedSuperadmins: skippedSuperadmins,
+        skippedByUid: skippedByUid
       });
     } catch (err) {
-      console.error("enableHostelAndEmployees error:", err);
-      return res.status(500).json({ error: err.message });
+      console.error("enableHostelAndEmployees error:", err && err.message ? err.message : String(err));
+      return res.status(500).json({ error: err && err.message ? err.message : "Internal error" });
     }
   });
 });
+/* ================== /DISABLE / ENABLE HOSTEL ================== */
