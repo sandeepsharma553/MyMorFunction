@@ -936,4 +936,453 @@ exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res)
     }
   });
 });
-/* ================== /DISABLE / ENABLE HOSTEL ================== */
+
+// ========== Maintenance: status update ==========
+exports.sendMaintenanceStatusNotification = onDocumentUpdated(
+  "maintenance/{maintId}",
+  async (event) => {
+    const before = event.data.before.data() || {};
+    const after = event.data.after.data() || {};
+    const { maintId } = event.params;
+
+    const beforeStatus = (before.status || "").trim();
+    const afterStatus = (after.status || "").trim();
+
+    // only act if status changed
+    if (!afterStatus || beforeStatus === afterStatus) {
+      console.log("No status change for maintenance", maintId);
+      return null;
+    }
+
+    const requesterUid = after.uid || before.uid;
+    const hostelid = after.hostelid || before.hostelid;
+    if (!requesterUid) {
+      console.log("No requester uid for maintenance", maintId);
+      return null;
+    }
+
+    // Tokens: look inside hostelTokens tree at specific uid
+    const snap = await db.ref(`/hostelTokens/${hostelid}/${requesterUid}`).once("value");
+    const val = snap.val();
+    if (!val) {
+      console.log("No tokens for user", requesterUid);
+      return null;
+    }
+
+    let tokens = [];
+    if (typeof val === "string") tokens = [val];
+    else if (Array.isArray(val)) tokens = val;
+    else if (typeof val === "object") {
+      if (val.token) tokens.push(val.token);
+      if (Array.isArray(val.tokens)) tokens.push(...val.tokens);
+      Object.values(val).forEach((maybe) => {
+        if (typeof maybe === "string") tokens.push(maybe);
+        if (Array.isArray(maybe)) tokens.push(...maybe);
+      });
+    }
+    tokens = Array.from(new Set(tokens.filter(Boolean)));
+
+    if (!tokens.length) {
+      console.log("No FCM tokens found for requester", requesterUid);
+      return null;
+    }
+
+    const issue = after.problemcategory || "Maintenance";
+    const room = after.roomno || "";
+
+    const payload = {
+      notification: {
+        title: "Maintenance Status Update",
+        body: `Your request "${issue}" for Room ${room} is now "${afterStatus}".`,
+      },
+      data: {
+        screen: "MaintenanceRequest",
+        type: "maintenance_status",
+        maintenanceId: maintId,
+        status: afterStatus,
+        hostelid: hostelid || "",
+      },
+    };
+
+    try {
+      const response = await admin.messaging().sendEachForMulticast({
+        tokens,
+        ...payload,
+      });
+      console.log(
+        `[sendMaintenanceStatusNotification] ${response.successCount} notifications sent for ${maintId}`
+      );
+      return response;
+    } catch (err) {
+      console.error("Error sending maintenance notification:", err);
+      return null;
+    }
+  }
+);
+
+// ========= Helper: collect tokens for a specific user in a hostel =========
+async function tokensForUser(hostelid, uid) {
+  if (!hostelid || !uid) return [];
+  const snap = await db.ref(`/hostelTokens/${hostelid}/${uid}`).once("value");
+  const val = snap.val();
+  if (!val) return [];
+
+  let tokens = [];
+  if (typeof val === "string") tokens = [val];
+  else if (Array.isArray(val)) tokens = val;
+  else if (typeof val === "object") {
+    if (val.token) tokens.push(val.token);
+    if (Array.isArray(val.tokens)) tokens.push(...val.tokens);
+    Object.values(val).forEach((maybe) => {
+      if (typeof maybe === "string") tokens.push(maybe);
+      if (Array.isArray(maybe)) tokens.push(...maybe);
+    });
+  }
+  return Array.from(new Set(tokens.filter(Boolean)));
+}
+// ========== Report Incident: status update ==========
+exports.sendIncidentStatusNotification = onDocumentUpdated(
+  "reportincident/{incidentId}",
+  async (event) => {
+    const before = event.data.before.data() || {};
+    const after = event.data.after.data() || {};
+    const { incidentId } = event.params;
+
+    const beforeStatus = (before.status || "").trim();
+    const afterStatus  = (after.status  || "").trim();
+    if (!afterStatus || beforeStatus === afterStatus) {
+      console.log("[Incident] No status change for", incidentId);
+      return null;
+    }
+
+    const requesterUid = after.uid || before.uid;
+    const hostelid     = after.hostelid || before.hostelid;
+    if (!requesterUid || !hostelid) {
+      console.log("[Incident] Missing uid/hostelid for", incidentId);
+      return null;
+    }
+
+    const tokens = await tokensForUser(hostelid, requesterUid);
+    if (!tokens.length) {
+      console.log("[Incident] No tokens for user", requesterUid);
+      return null;
+    }
+
+    const titleOrType = after.title || after.incidentType || after.category || "Incident";
+    const location    = after.location || after.roomno || "";
+
+    const payload = {
+      notification: {
+        title: "Incident Status Update",
+        body: `Your incident "${titleOrType}"${location ? ` (${location})` : ""} is now "${afterStatus}".`,
+      },
+      data: {
+        screen: "Report",
+        type: "incident_status",
+        incidentId,
+        status: afterStatus,
+        hostelid: hostelid || "",
+      },
+    };
+
+    try {
+      const resp = await admin.messaging().sendEachForMulticast({ tokens, ...payload });
+      console.log(`[sendIncidentStatusNotification] ${resp.successCount} sent for ${incidentId}`);
+      return resp;
+    } catch (err) {
+      console.error("[Incident] FCM error:", err);
+      return null;
+    }
+  }
+);
+// ========== Feedback: status update ==========
+exports.sendFeedbackStatusNotification = onDocumentUpdated(
+  "feedback/{feedbackId}",
+  async (event) => {
+    const before = event.data.before.data() || {};
+    const after  = event.data.after.data() || {};
+    const { feedbackId } = event.params;
+
+    const beforeStatus = (before.status || "").trim();
+    const afterStatus  = (after.status  || "").trim();
+    if (!afterStatus || beforeStatus === afterStatus) {
+      console.log("[Feedback] No status change for", feedbackId);
+      return null;
+    }
+
+    const requesterUid = after.uid || before.uid;
+    const hostelid     = after.hostelid || before.hostelid;
+    if (!requesterUid || !hostelid) {
+      console.log("[Feedback] Missing uid/hostelid for", feedbackId);
+      return null;
+    }
+
+    const tokens = await tokensForUser(hostelid, requesterUid);
+    if (!tokens.length) {
+      console.log("[Feedback] No tokens for user", requesterUid);
+      return null;
+    }
+
+    const subjectOrType = after.subject || after.title || after.category || "Feedback";
+
+    const payload = {
+      notification: {
+        title: "Feedback Status Update",
+        body: `Your feedback "${subjectOrType}" is now "${afterStatus}".`,
+      },
+      data: {
+        screen: "Feedback",
+        type: "feedback_status",
+        feedbackId,
+        status: afterStatus,
+        hostelid: hostelid || "",
+      },
+    };
+
+    try {
+      const resp = await admin.messaging().sendEachForMulticast({ tokens, ...payload });
+      console.log(`[sendFeedbackStatusNotification] ${resp.successCount} sent for ${feedbackId}`);
+      return resp;
+    } catch (err) {
+      console.error("[Feedback] FCM error:", err);
+      return null;
+    }
+  }
+);
+
+
+// ========== Booking: status update ==========
+exports.sendBookingStatusNotification = onDocumentUpdated(
+  "bookingroom/{bookingId}",
+  async (event) => {
+    const before = event.data.before.data() || {};
+    const after  = event.data.after.data()  || {};
+    const { bookingId } = event.params;
+
+    const prev = (before.status || "").trim();
+    const next = (after.status  || "").trim();
+
+    // Only notify on a change
+    if (!next || prev === next) {
+      console.log("[Booking] No status change for", bookingId);
+      return null;
+    }
+
+    const requesterUid = after.uid || before.uid;
+    const hostelid     = after.hostelid || before.hostelid;
+    if (!requesterUid || !hostelid) {
+      console.log("[Booking] Missing uid/hostelid for", bookingId);
+      return null;
+    }
+
+    const tokens = await tokensForUser(hostelid, requesterUid);
+    if (!tokens.length) {
+      console.log("[Booking] No tokens for user", requesterUid);
+      return null;
+    }
+
+    const roomName   = after.roomname || before.roomname || "Room";
+    const datePretty = (() => {
+      try {
+        const s = (after.startdate || before.startdate);
+        const e = (after.enddate   || before.enddate);
+        const sd = s.toDate ? s.toDate() : s ? new Date(s) : null;
+        const ed = e.toDate ? e.toDate() : e ? new Date(e) : null;
+        if (!sd) return "";
+        const fmt = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        return ed
+          ? ` ${sd.toDateString()} • ${fmt(sd)}–${fmt(ed)}`
+          : ` ${sd.toDateString()}`;
+      } catch (err) {
+        return "";
+      }
+    })();
+
+    // Slightly different copy if specifically rejected
+    const isRejected = next.toLowerCase() === "rejected";
+    const title = isRejected ? "Booking Rejected" : "Booking Status Updated";
+    const body  = isRejected
+      ? `Your booking for ${roomName}${datePretty} was rejected.`
+      : `Your booking for ${roomName}${datePretty} is now "${next}".`;
+
+    const payload = {
+      notification: { title, body },
+      data: {
+        screen: "BookingDetail",
+        type: "booking_status",
+        bookingId,
+        status: next,
+        hostelid: hostelid || "",
+      },
+    };
+
+    try {
+      const resp = await admin.messaging().sendEachForMulticast({ tokens, ...payload });
+      console.log(`[sendBookingStatusNotification] ${resp.successCount} sent for ${bookingId} (${prev} → ${next})`);
+      return resp;
+    } catch (err) {
+      console.error("[Booking] FCM error:", err);
+      return null;
+    }
+  }
+);
+
+
+exports.setUsersDisabledBulk = functions.https.onCall(async (data, context) => {
+  // Optional: enforce admin
+  const claims = (context.auth && context.auth.token) || {};
+  if (!claims || claims.admin !== true) {
+    throw new functions.https.HttpsError("permission-denied", "Only admins can perform this action.");
+  }
+
+  const toDisable = Array.isArray(data.toDisable) ? data.toDisable : [];
+  const toEnable  = Array.isArray(data.toEnable)  ? data.toEnable  : [];
+
+  const fs = admin.firestore();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  // ---- 1) Auth updates (batched) ----
+  for (const group of chunk(toDisable, 50)) {
+    await Promise.all(
+      group.map(uid =>
+        admin.auth().updateUser(uid, { disabled: true }).catch(e => {
+          console.error("[Auth bulk disable] failed for", uid, e.message || String(e));
+          return null;
+        })
+      )
+    );
+    await new Promise(r => setTimeout(r, 120));
+  }
+
+  for (const group of chunk(toEnable, 50)) {
+    await Promise.all(
+      group.map(uid =>
+        admin.auth().updateUser(uid, { disabled: false }).catch(e => {
+          console.error("[Auth bulk enable] failed for", uid, e.message || String(e));
+          return null;
+        })
+      )
+    );
+    await new Promise(r => setTimeout(r, 120));
+  }
+
+  // ---- 2) Firestore updates (batched) ----
+  const writeBatches = [];
+
+  const writeChunk = async (uids, status) => {
+    const b = fs.batch();
+    uids.forEach(uid => {
+      const ref = fs.collection("users").doc(uid); // doc.id == uid
+      if (status === "disabled") {
+        b.set(ref, {
+          accountStatus: "disabled",
+          verified: false,
+          disabledReason: "Not present in verification upload",
+          disabledAt: now
+        }, { merge: true });
+      } else {
+        b.set(ref, {
+          accountStatus: "active",
+          verified: true,
+          verifiedAt: now,
+          disabledReason: null,
+          disabledAt: null
+        }, { merge: true });
+      }
+    });
+    writeBatches.push(b.commit());
+  };
+
+  for (const group of chunk(toDisable, 400)) await writeChunk(group, "disabled");
+  for (const group of chunk(toEnable, 400))  await writeChunk(group, "active");
+  await Promise.all(writeBatches);
+
+  return {
+    success: true,
+    disabledCount: toDisable.length,
+    enabledCount: toEnable.length
+  };
+});
+exports.bulkSetUsersStatus = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      if (req.method !== "POST") {
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
+      }
+
+      const body = req.body || {};
+      const toDisable = Array.isArray(body.toDisable) ? body.toDisable : [];
+      const toEnable  = Array.isArray(body.toEnable)  ? body.toEnable  : [];
+
+      const fs = admin.firestore();
+      const now = admin.firestore.FieldValue.serverTimestamp();
+
+      // (Optional) Add your own auth/secret check here if exposed publicly.
+
+      // 1) Auth updates
+      for (const group of chunk(toDisable, 50)) {
+        await Promise.all(
+          group.map(uid =>
+            admin.auth().updateUser(uid, { disabled: true }).catch(e => {
+              console.error("[Auth bulk disable] failed for", uid, e.message || String(e));
+              return null;
+            })
+          )
+        );
+        await new Promise(r => setTimeout(r, 120));
+      }
+
+      for (const group of chunk(toEnable, 50)) {
+        await Promise.all(
+          group.map(uid =>
+            admin.auth().updateUser(uid, { disabled: false }).catch(e => {
+              console.error("[Auth bulk enable] failed for", uid, e.message || String(e));
+              return null;
+            })
+          )
+        );
+        await new Promise(r => setTimeout(r, 120));
+      }
+
+      // 2) Firestore updates
+      const writeBatches = [];
+
+      const writeChunk = async (uids, status) => {
+        const b = fs.batch();
+        uids.forEach(uid => {
+          const ref = fs.collection("users").doc(uid); // doc.id == uid
+          if (status === "disabled") {
+            b.set(ref, {
+              accountStatus: "disabled",
+              verified: false,
+              disabledReason: "Not present in verification upload",
+              disabledAt: now
+            }, { merge: true });
+          } else {
+            b.set(ref, {
+              accountStatus: "active",
+              verified: true,
+              verifiedAt: now,
+              disabledReason: null,
+              disabledAt: null
+            }, { merge: true });
+          }
+        });
+        writeBatches.push(b.commit());
+      };
+
+      for (const group of chunk(toDisable, 400)) await writeChunk(group, "disabled");
+      for (const group of chunk(toEnable, 400))  await writeChunk(group, "active");
+      await Promise.all(writeBatches);
+
+      return res.status(200).json({
+        success: true,
+        disabledCount: toDisable.length,
+        enabledCount: toEnable.length
+      });
+    } catch (err) {
+      console.error("bulkSetUsersStatus error:", err.message || String(err));
+      return res.status(500).json({ error: err.message || "Internal error" });
+    }
+  });
+});
