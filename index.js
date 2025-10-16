@@ -15,7 +15,7 @@ const rtdb = admin.database();
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
-    user: "chiggy14@gmaill.com",
+    user: "chiggy14@gmail.com",
     pass: "xggf umkg lpwk kbqn",
   },
 });
@@ -97,6 +97,23 @@ async function tokensForHostel(hostelid, excludeUid = null) {
   // dedupe
   return Array.from(new Set(tokens.filter(Boolean)));
 }
+// Collect tokens for all members of a group (excluding sender), deduped
+async function tokensForGroupMembers(hostelid, groupId, excludeUid = null) {
+  // members live in RTDB: /groups/{groupId}/members
+  const snap = await db.ref(`/groups/${groupId}/members`).once("value");
+  const members = snap.val() || {};
+
+  // member keys are user UIDs in your schema
+  const memberUids = Object.keys(members).filter((uid) => uid && uid !== String(excludeUid));
+
+  // gather tokens per member (scoped to hostel)
+  const tokenSets = await Promise.all(memberUids.map((uid) => tokensForUser(hostelid, uid)));
+  const all = tokenSets.flat().filter(Boolean);
+
+  // dedupe
+  return Array.from(new Set(all));
+}
+
 
 // ========== Group chat ==========
 exports.sendGroupMessageNotification = onValueCreated(
@@ -105,23 +122,25 @@ exports.sendGroupMessageNotification = onValueCreated(
     const { groupId } = event.params;
     const messageData = event.data.val() || {};
 
-    const groupName = messageData.groupName;
-    const senderId = messageData.senderId;
+    const groupName = messageData.groupName || "";
+    const senderId  = messageData.senderId || "";
     const senderName = messageData.sender || "Someone";
     const messageText = messageData.text || "";
     const type = messageData.type || "";
     const posterUrl = messageData.posterUrl || "";
 
-    // Resolve hostelid (prefer from message, fallback to group)
+    // Resolve hostelid (prefer message, fallback to group)
     let hostelid = messageData.hostelid;
     if (!hostelid) {
       const gSnap = await db.ref(`/groups/${groupId}`).once("value");
-      hostelid = gSnap.val() && gSnap.val().hostelid;
+      const gVal = gSnap.val() || {};
+      hostelid = gVal.hostelid || "";
     }
 
-    const tokens = await tokensForHostel(hostelid, senderId);
+    // === NEW: only notify group members (exclude sender) ===
+    const tokens = await tokensForGroupMembers(hostelid, groupId, senderId);
     if (!tokens.length) {
-      console.log("No hostel tokens found");
+      console.log("[sendGroupMessageNotification] No member tokens found");
       return null;
     }
 
@@ -134,12 +153,13 @@ exports.sendGroupMessageNotification = onValueCreated(
               audio: "sent a voice message",
               video: "sent a video",
               event: "created an event",
-              poll: "created a poll",
+              poll:  "created a poll",
             }[type] || "sent a message"
           }`;
 
-    const payload = {
-      notification: { title: groupName, body },
+    // Prepare payload (keep your data keys)
+    const base = {
+      notification: { title: groupName || "New message", body },
       data: {
         screen: "GroupChat",
         type: "groupMessage",
@@ -154,15 +174,24 @@ exports.sendGroupMessageNotification = onValueCreated(
       },
     };
 
+    // FCM supports up to 500 tokens per multicast call—chunk defensively
+    const chunkSize = 500;
+    const chunks = [];
+    for (let i = 0; i < tokens.length; i += chunkSize) {
+      chunks.push(tokens.slice(i, i + chunkSize));
+    }
+
     try {
-      const response = await admin.messaging().sendEachForMulticast({
-        tokens,
-        ...payload,
-      });
-      console.log(`${response.successCount} messages were sent successfully`);
-      return response;
+      let success = 0, failure = 0;
+      for (const chunk of chunks) {
+        const resp = await admin.messaging().sendEachForMulticast({ tokens: chunk, ...base });
+        success += resp.successCount;
+        failure += resp.failureCount;
+      }
+      console.log(`[sendGroupMessageNotification] Sent to members: success=${success} failure=${failure} total=${tokens.length}`);
+      return { success, failure, total: tokens.length };
     } catch (error) {
-      console.error("Error sending FCM:", error);
+      console.error("[sendGroupMessageNotification] FCM error:", error);
       return null;
     }
   }
@@ -1386,3 +1415,143 @@ exports.bulkSetUsersStatus = functions.https.onRequest((req, res) => {
     }
   });
 });
+
+// ========== Groups: join request (notify creator for Private/Hidden) ==========
+exports.notifyJoinRequest = onValueCreated(
+  "/groups/{groupId}/joinRequests/{requesterUid}",
+  async (event) => {
+    try {
+      const { groupId, requesterUid } = event.params;
+      const joinReq = event.data.val() || {};
+
+      // Only when request is created (or is pending)
+      const status = (joinReq.status || "pending").toLowerCase();
+      if (status !== "pending") {
+        console.log("[notifyJoinRequest] status not pending, skip:", status);
+        return null;
+      }
+
+      // Load group → need creatorId, groupType, title, hostelid
+      const gSnap = await db.ref(`/groups/${groupId}`).once("value");
+      const group = gSnap.val() || {};
+      const creatorId = group.creatorId;
+      const privacy   = group.groupType || "Private";
+      const hostelid  = group.hostelid || "";
+
+      if (!creatorId) {
+        console.log("[notifyJoinRequest] no creatorId for group", groupId);
+        return null;
+      }
+      if (!(privacy === "Private" || privacy === "Hidden")) {
+        console.log("[notifyJoinRequest] groupType not Private/Hidden:", privacy);
+        return null;
+      }
+
+      // 1) Write an in-app notification for creator
+      const notifRef = db.ref(`/notifications/${creatorId}`).push();
+      const payload = {
+        id: notifRef.key,
+        type: "group:join_request",
+        groupId,
+        groupTitle: group.title || "",
+        privacy,
+        fromUid: requesterUid,
+        fromName: joinReq.name || "",
+        fromPhoto: joinReq.photoURL || "",
+        createdAt: Date.now(),
+        read: false,
+      };
+      await notifRef.set(payload);
+
+      // (Optional) also create an inbox thread if you use it in UI
+      await db
+        .ref(`/userInboxes/${creatorId}/groupJoinRequests/${groupId}/${requesterUid}`)
+        .set({ ...payload, requestedAt: Date.now() });
+
+      // 2) Send FCM push to the creator (scoped by hostel)
+      // Reuses your hostel-based token tree + helper
+      const tokens = await tokensForUser(hostelid, creatorId);
+      if (!tokens.length) {
+        console.log("[notifyJoinRequest] no creator tokens found");
+        return null;
+      }
+
+      const message = {
+        notification: {
+          title: "New join request",
+          body: `${payload.fromName || "Someone"} requested to join "${payload.groupTitle || "your group"}"`,
+        },
+        data: {
+          type: "group:join_request",
+          screen: "AcademicGroup",       // customize for your nav
+          groupId,
+          hostelid: hostelid || "",
+        },
+      };
+
+      // Chunked send (keeps consistency with your other senders)
+      const chunkSize = 500;
+      for (let i = 0; i < tokens.length; i += chunkSize) {
+        const batch = tokens.slice(i, i + chunkSize);
+        await admin.messaging().sendEachForMulticast({ tokens: batch, ...message });
+      }
+      console.log("[notifyJoinRequest] push sent to creator:", creatorId);
+
+      return null;
+    } catch (err) {
+      console.error("[notifyJoinRequest] error:", err && err.message ? err.message : String(err));
+      return null;
+    }
+  }
+);
+
+// ========== Groups: join approved (notify requester) ==========
+exports.notifyJoinApproved = onValueCreated(
+  "/groups/{groupId}/joinRequests/{requesterUid}/status",
+  async (event) => {
+    const { groupId, requesterUid } = event.params;
+    const status = (event.data.val() || '').toLowerCase();
+    if (status !== 'approved') return null;
+
+    // group load
+    const gSnap = await getDatabase().ref(`/groups/${groupId}`).once('value');
+    const group = gSnap.val() || {};
+    const hostelid = group.hostelid || '';
+    const title = group.title || 'Group';
+
+    // requester ke tokens (aapke helpers ke saath)
+    const tokens = await tokensForUser(hostelid, requesterUid);
+    if (!tokens.length) return null;
+
+    // in-app notification bhi likh do (server-authoritative)
+    const notifRef = getDatabase().ref(`/notifications/${requesterUid}`).push();
+    await notifRef.set({
+      id: notifRef.key,
+      type: 'group:join_approved',
+      groupId,
+      groupTitle: title,
+      createdAt: Date.now(),
+      read: false,
+    });
+
+    const message = {
+      notification: {
+        title: 'Request approved',
+        body: `You can now chat in "${title}"`,
+      },
+      data: {
+        type: 'group:join_approved',
+        screen: 'GroupChat',
+        groupId,
+        groupTitle: title,
+      },
+    };
+
+    const chunkSize = 500;
+    for (let i = 0; i < tokens.length; i += chunkSize) {
+      const batch = tokens.slice(i, i + chunkSize);
+      await admin.messaging().sendEachForMulticast({ tokens: batch, ...message });
+    }
+    return null;
+  }
+);
