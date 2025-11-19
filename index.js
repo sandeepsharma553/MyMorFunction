@@ -113,8 +113,6 @@ async function tokensForGroupMembers(hostelid, groupId, excludeUid = null) {
   // dedupe
   return Array.from(new Set(all));
 }
-
-
 // ========== Group chat ==========
 exports.sendGroupMessageNotification = onValueCreated(
   "/messages/{groupId}/{messageId}",
@@ -196,7 +194,6 @@ exports.sendGroupMessageNotification = onValueCreated(
     }
   }
 );
-
 // ========== Announcements: comment ==========
 exports.sendAnnouncementsCommentNotification = onValueCreated(
   "/announcements/{announcementId}/comments/{commentId}",
@@ -248,7 +245,6 @@ exports.sendAnnouncementsCommentNotification = onValueCreated(
     }
   }
 );
-
 // ========== Announcements: reply ==========
 exports.sendAnnouncementsReplyNotification = onValueCreated(
   "/announcements/{announcementId}/comments/{commentId}/replies/{replyId}",
@@ -303,7 +299,6 @@ exports.sendAnnouncementsReplyNotification = onValueCreated(
     }
   }
 );
-
 // ========== Community: new post ==========
 exports.sendCommunitynNewPostNotification = onValueCreated(
   "/community/{postId}",
@@ -491,7 +486,6 @@ exports.sendMenuUpdateNotification = onDocumentUpdated(
     }
   }
 );
-
 // ========== Admin HTTP endpoints (unchanged) ==========
 exports.deleteUserByUid = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
@@ -522,7 +516,6 @@ exports.deleteUserByUid = functions.https.onRequest((req, res) => {
     }
   });
 });
-
 exports.sendAnnouncementsNewNotification = onValueCreated(
   "/announcements/{announcementId}",
   async (event) => {
@@ -1555,3 +1548,105 @@ exports.notifyJoinApproved = onValueCreated(
     return null;
   }
 );
+
+// ========== Group Invite Link Creation ==========
+exports.createInvite = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      if (req.method !== "POST") {
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
+      }
+
+      const { uid, gid, maxUses = 50, ttlHours = 72 } = req.body || {};
+      if (!uid || !gid) {
+        return res.status(400).json({ error: "Missing uid or gid" });
+      }
+
+      const token = require("crypto").randomBytes(12).toString("hex");
+      const expiresAt = Date.now() + ttlHours * 60 * 60 * 1000;
+
+      await admin.firestore().collection("invites").doc(token).set({
+        gid,
+        createdBy: uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt,
+        maxUses,
+        uses: 0,
+        active: true,
+      });
+
+      // IMPORTANT: include g + t so your RN parse matches
+      const shareUrl = `https://links.mymor.app/invite?g=${gid}&t=${token}`;
+
+      console.log(`[createInvite] ✅ Created invite for group ${gid}: ${shareUrl}`);
+
+      return res.status(200).json({
+        success: true,
+        token,
+        gid,
+        shareUrl,
+        expiresAt: new Date(expiresAt).toISOString(),
+      });
+    } catch (err) {
+      console.error("[createInvite] Error:", err);
+      return res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+  });
+});
+exports.acceptInvite = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      if (req.method !== "POST") {
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
+      }
+
+      const { uid, gid, tokenId } = req.body || {};
+      if (!uid || !gid || !tokenId) {
+        return res.status(400).json({ error: "Missing uid, gid, or tokenId" });
+      }
+
+      const inviteRef = fsdb.collection("invites").doc(tokenId);
+      const snap = await inviteRef.get();
+
+      if (!snap.exists) {
+        return res.status(404).json({ error: "Invite not found" });
+      }
+
+      const invite = snap.data() || {};
+      const now = Date.now();
+
+      if (!invite.active)          return res.status(400).json({ error: "Invite is inactive" });
+      if (invite.expiresAt && invite.expiresAt < now)
+        return res.status(400).json({ error: "Invite expired" });
+      if (invite.gid !== gid)      return res.status(400).json({ error: "Invite does not match this group" });
+      if (invite.maxUses && invite.uses >= invite.maxUses)
+        return res.status(400).json({ error: "Invite max uses reached" });
+
+      const memberPath = `/discovergroup/${gid}/members/${uid}`;
+
+      // optional: avoid duplicate
+      const existing = await db.ref(memberPath).once("value");
+      if (!existing.exists()) {
+        await db.ref(memberPath).set({
+          uid,
+          isAdmin: false,
+          joinedAt: Date.now(),
+        });
+      }
+
+      await inviteRef.update({
+        uses: admin.firestore.FieldValue.increment(1),
+      });
+
+      return res.status(200).json({
+        success: true,
+        gid,
+        tokenId,
+        joined: true,
+      });
+    } catch (err) {
+      console.error("[acceptInvite] Error:", err);
+      return res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+  });
+});
