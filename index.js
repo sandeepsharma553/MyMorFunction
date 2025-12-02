@@ -2,7 +2,7 @@
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const { onValueCreated } = require("firebase-functions/v2/database");
-const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onDocumentUpdated,onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { getDatabase } = require("firebase-admin/database");
 const cors = require("cors")({ origin: true });
 const nodemailer = require("nodemailer");
@@ -484,6 +484,69 @@ exports.sendMenuUpdateNotification = onDocumentUpdated(
       console.error("Error sending menu update notification:", error);
       return null;
     }
+  }
+);
+// ========== Dining Menu: new upload notification ==========
+exports.sendMenuUpdateNotification = onDocumentCreated(
+  "menus_uploads/{uploadId}",
+  async (event) => {
+    const data = event.data.data() || {};
+    const hostelid     = data.hostelid;
+    const createdCount = Number(data.createdCount || 0);
+    const firstDate    = data.firstDate || "";
+    const lastDate     = data.lastDate || "";
+
+    if (!hostelid || !createdCount) {
+      console.log("[sendMenuUpdateNotification] Missing hostelid/createdCount, skipping.");
+      return null;
+    }
+
+    const tokens = await tokensForHostel(hostelid);
+    if (!tokens || !tokens.length) {
+      console.log("[sendMenuUpdateNotification] No FCM tokens found for hostel:", hostelid);
+      return null;
+    }
+
+    const rangeLabel =
+      firstDate && lastDate && firstDate !== lastDate
+        ? `${firstDate} → ${lastDate}`
+        : firstDate || lastDate || "upcoming days";
+
+    const payload = {
+      notification: {
+        title: "Dining Menu Updated",
+        body: `New dining menu uploaded for ${rangeLabel}.`,
+      },
+      data: {
+        screen: "DiningMenu",
+        type: "menuUpload",
+        hostelid: hostelid || "",
+        firstDate: String(firstDate || ""),
+        lastDate: String(lastDate || ""),
+        createdCount: String(createdCount),
+      },
+    };
+
+    const chunkSize = 500;
+    let success = 0;
+    let failure = 0;
+
+    for (let i = 0; i < tokens.length; i += chunkSize) {
+      const batch = tokens.slice(i, i + chunkSize);
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens: batch,
+        ...payload,
+      });
+      success += resp.successCount;
+      failure += resp.failureCount;
+    }
+
+    console.log(
+      `[sendMenuUpdateNotification] Sent dining upload notification to hostel=${hostelid}, ` +
+      `createdCount=${createdCount}, success=${success}, failure=${failure}, totalTokens=${tokens.length}`
+    );
+
+    return null;
   }
 );
 // ========== Admin HTTP endpoints (unchanged) ==========
