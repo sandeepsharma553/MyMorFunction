@@ -57,8 +57,11 @@ function getSmtpTransporter() {
   smtpTransporter = nodemailer.createTransport({
     host,
     port,
-    secure: port === 465, // GoDaddy 465 → true, 587 → false
+    secure: true, // GoDaddy 465 → true, 587 → false
     auth: { user, pass },
+    tls: {
+      servername: "smtp.titan.email",
+    },
   });
 
   return smtpTransporter;
