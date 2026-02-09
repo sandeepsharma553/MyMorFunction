@@ -2193,3 +2193,79 @@ exports.updateUserEmailByUid = functions.https.onRequest((req, res) => {
     }
   });
 });
+// ========== UNICLUB: Join Approved / Rejected (notify requester) ==========
+exports.notifyUniclubJoinDecision = onValueCreated(
+  "/uniclubs/{clubId}/joinRequests/{requesterUid}/status",
+  async (event) => {
+    try {
+      const { clubId, requesterUid } = event.params;
+      const statusRaw = event.data.val();
+      const status = String(statusRaw || "").toLowerCase().trim();
+
+      if (status !== "approved" && status !== "rejected") {
+        console.log("[notifyUniclubJoinDecision] status not approved/rejected:", status);
+        return null;
+      }
+
+      // 1) Load club info (title + optional hostelid)
+      const cSnap = await db.ref(`/uniclubs/${clubId}`).once("value");
+      const club = cSnap.val() || {};
+      const clubTitle = club.title || club.name || "Club";
+      const hostelid = club.hostelid || "";
+
+      // 2) Tokens of requester (FCM)
+      const tokens = await tokensForUserId(requesterUid);
+      // agar aap hostel-wise token use karna chahte ho, replace with tokensForUser(hostelid, requesterUid)
+
+      // 3) Save in-app notification (RTDB)
+      const notifRef = db.ref(`/notifications/${requesterUid}`).push();
+      const notifPayload = {
+        id: notifRef.key,
+        type: status === "approved" ? "uniclub:join_approved" : "uniclub:join_rejected",
+        clubId,
+        clubTitle,
+        status,
+        createdAt: Date.now(),
+        read: false,
+      };
+      await notifRef.set(notifPayload);
+
+      // 4) Send push notification (if tokens exist)
+      if (!tokens.length) {
+        console.log("[notifyUniclubJoinDecision] no tokens for requester:", requesterUid);
+        return null;
+      }
+
+      const message = {
+        notification: {
+          title: status === "approved" ? "Request approved ✅" : "Request rejected ❌",
+          body:
+            status === "approved"
+              ? `You are now a member of "${clubTitle}".`
+              : `Your request to join "${clubTitle}" was rejected.`,
+        },
+        data: {
+          type: status === "approved" ? "uniclub:join_approved" : "uniclub:join_rejected",
+          screen: "UniclubDetail", // aapke app screen name ke hisaab se change kar lo
+          clubId,
+          clubTitle,
+          status,
+          hostelid: String(hostelid || ""),
+        },
+      };
+
+      // chunk send
+      const chunkSize = 500;
+      for (let i = 0; i < tokens.length; i += chunkSize) {
+        const batch = tokens.slice(i, i + chunkSize);
+        await admin.messaging().sendEachForMulticast({ tokens: batch, ...message });
+      }
+
+      console.log(`[notifyUniclubJoinDecision] sent: club=${clubId} user=${requesterUid} status=${status}`);
+      return null;
+    } catch (err) {
+      console.error("[notifyUniclubJoinDecision] error:", err.message || String(err));
+      return null;
+    }
+  }
+);
