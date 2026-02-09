@@ -2269,3 +2269,91 @@ exports.notifyUniclubJoinDecision = onValueCreated(
     }
   }
 );
+// ✅ Mentions notification (RTDB v2)
+exports.notifyMentionedUsers = onValueCreated(
+  "/social/{groupId}/{postId}",
+  async (event) => {
+    const post = event.data.val() || {};
+    const { groupId, postId } = event.params;
+
+    const senderId = post.senderId || "";
+    const senderName = post.sender || "Someone";
+
+    const mentionUids = Array.isArray(post.mentionUids) ? post.mentionUids : [];
+    if (!mentionUids.length) return null;
+
+    // prevent notifying self
+    const targets = mentionUids.filter((u) => u && u !== senderId);
+    if (!targets.length) return null;
+
+    const updates = {};
+    const now = Date.now();
+
+    // ✅ Build updates for in-app notifications + idempotency marker
+    for (const targetUid of targets) {
+      const already =
+        post &&
+        post.mentionNotified &&
+        post.mentionNotified[targetUid];
+
+      if (already) continue;
+
+      const notifRef = db.ref(`/notifications/${targetUid}`).push();
+      const nid = notifRef.key;
+
+      updates[`/notifications/${targetUid}/${nid}`] = {
+        id: nid,
+        type: "mention",
+        title: "You were mentioned",
+        body: `${senderName} mentioned you in a post`,
+        createdAt: now,
+        read: false,
+        data: {
+          groupId,
+          postId,
+          senderId,
+          path: post.path || "",
+        },
+      };
+
+      updates[`/social/${groupId}/${postId}/mentionNotified/${targetUid}`] = true;
+    }
+
+    if (Object.keys(updates).length) {
+      await db.ref().update(updates);
+    }
+
+    // ✅ Optional: push notification using your existing hostel token system if possible
+    // If you use tokensForUserId(uid) already, use that:
+    try {
+      let allTokens = [];
+      for (const targetUid of targets) {
+        const t = await tokensForUserId(targetUid); // <-- your helper at bottom
+        allTokens = allTokens.concat(t);
+      }
+
+      const uniqueTokens = Array.from(new Set(allTokens)).filter(Boolean);
+
+      if (uniqueTokens.length) {
+        await admin.messaging().sendEachForMulticast({
+          tokens: uniqueTokens,
+          notification: {
+            title: "You were mentioned",
+            body: `${senderName} mentioned you in a post`,
+          },
+          data: {
+            type: "mention",
+            screen: "Community", // adjust if you have a post detail screen
+            groupId: String(groupId),
+            postId: String(postId),
+            senderId: String(senderId || ""),
+          },
+        });
+      }
+    } catch (e) {
+      console.log("[notifyMentionedUsers] FCM error:", e.message || String(e));
+    }
+
+    return null;
+  }
+);
