@@ -5,8 +5,10 @@ const { onValueCreated } = require("firebase-functions/v2/database");
 const { onDocumentUpdated, onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { getDatabase } = require("firebase-admin/database");
 const { onRequest } = require("firebase-functions/v2/https");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret } = require("firebase-functions/params");
 const cors = require("cors")({ origin: true });
+
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
@@ -44,29 +46,12 @@ const OTP_SECRET = defineSecret("OTP_SECRET");
 //   //   pass: "xggf umkg lpwk kbqn",
 //   // },
 // });
-let smtpTransporter = null;
-function getSmtpTransporter() {
-  if (smtpTransporter) return smtpTransporter;
-
-  // ✅ secrets read ONLY at runtime
-  const host = SMTP_HOST.value();
-  const port = Number(SMTP_PORT.value());
-  const user = SMTP_USER.value();
-  const pass = SMTP_PASS.value();
-
-  smtpTransporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: true, // GoDaddy 465 → true, 587 → false
-    auth: { user, pass },
-    tls: {
-      servername: "smtp.titan.email",
-    },
-  });
-
-  return smtpTransporter;
+function withTimeout(promise, ms, label = "timeout") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+  ]);
 }
-
 function validateEmail(email) {
   const re = /\S+@\S+\.\S+/;
   return re.test(email);
@@ -78,6 +63,32 @@ function sha256(str) {
 function otpHash(email, code, otpSecret) {
   return sha256(`${String(email).toLowerCase().trim()}:${code}:${otpSecret}`);
 }
+let smtpTransporter = null;
+function getSmtpTransporter() {
+  if (smtpTransporter) return smtpTransporter;
+
+  const host = String(SMTP_HOST.value() || "").trim(); // smtp.titan.email
+  const port = Number(String(SMTP_PORT.value() || "").trim()); // 465
+  const user = String(SMTP_USER.value() || "").trim();
+  const pass = String(SMTP_PASS.value() || "").trim();
+
+  const secure = port === 465;
+  smtpTransporter = nodemailer.createTransport({
+    host: "smtpout.secureserver.net",
+    port: 465,
+    secure: true, // IMPORTANT
+    auth: {
+      user: SMTP_USER.value(),
+      pass: SMTP_PASS.value(),
+    },
+    pool: true, 
+    maxConnections: 1,
+    maxMessages: 5,
+  });
+
+  return smtpTransporter;
+}
+
 
 // exports.sendVerificationCode = functions.https.onRequest(async (req, res) => {
 //   if (req.method !== "POST") {
@@ -121,7 +132,6 @@ function otpHash(email, code, otpSecret) {
 //   }
 // });
 
-// ========== Helper: collect tokens by hostel ==========
 exports.sendVerificationCode = onRequest(
   {
     region: "us-central1",
@@ -130,40 +140,69 @@ exports.sendVerificationCode = onRequest(
   (req, res) => {
     cors(req, res, async () => {
       try {
+        if (req.method === "OPTIONS") return res.status(204).send("");
+        if (req.method !== "POST") {
+          return res.status(405).json({ error: { message: "Method Not Allowed" } });
+        }
+
         const email = String(req.body.email || "").toLowerCase().trim();
         if (!validateEmail(email)) {
           return res.status(400).json({ error: { message: "Invalid email" } });
         }
 
+        // Create code + requestId
         const code = String(Math.floor(100000 + Math.random() * 900000));
+        const requestId = crypto.randomUUID();
 
-        const transporter = getSmtpTransporter(); // ✅ global-like
+        const otpSecret = OTP_SECRET.value();
+        if (!otpSecret) throw new Error("OTP_SECRET not configured");
 
-        await transporter.sendMail({
-          from: `MyMor <${SMTP_USER.value()}>`,
-          to: email,
-          subject: "Your MyMor verification code",
-          text: `Your MyMor verification code is ${code}. It expires in 5 minutes.`,
+        const codeHash = otpHash(email, code, otpSecret);
+        const expiresAt = Date.now() + 5 * 60 * 1000; // 5 min
+
+        // Save OTP in Firestore
+        await fsdb.collection("emailOtps").doc(requestId).set({
+          email,
+          codeHash,
+          expiresAt,
+          attempts: 0,
+          used: false,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        return res.json({ success: true });
+        // Send email
+        const transporter = getSmtpTransporter();
+        await withTimeout(transporter.verify(), 8000, "SMTP verify timeout");
+        await withTimeout(
+          transporter.sendMail({
+            from: `MyMor <${SMTP_USER.value()}>`,
+            to: email,
+            subject: "Your MyMor verification code",
+            text: `Your MyMor verification code is ${code}. It expires in 5 minutes.`,
+          }),
+          15000,
+          "SMTP send timeout"
+        );
+
+        return res.status(200).json({ success: true, requestId });
       } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: { message: err.message } });
+        console.error("sendVerificationCode error:", err);
+        return res.status(500).json({ error: { message: err.message || "Failed to send code" } });
       }
     });
   }
 );
 
-
-/* ================= VERIFY CODE ================= */
+// ================== VERIFY OTP ==================
 exports.verifyEmailCode = onRequest(
   { region: "us-central1", secrets: [OTP_SECRET] },
   (req, res) => {
     cors(req, res, async () => {
       try {
         if (req.method === "OPTIONS") return res.status(204).send("");
-        if (req.method !== "POST") return res.status(405).json({ error: { message: "Method Not Allowed" } });
+        if (req.method !== "POST") {
+          return res.status(405).json({ error: { message: "Method Not Allowed" } });
+        }
 
         const email = String(req.body.email || "").trim().toLowerCase();
         const code = String(req.body.code || "").trim();
@@ -174,18 +213,23 @@ exports.verifyEmailCode = onRequest(
         }
 
         const otpSecret = OTP_SECRET.value();
-        if (!otpSecret) throw new Error("OTP secret not configured");
+        if (!otpSecret) throw new Error("OTP_SECRET not configured");
 
         const ref = fsdb.collection("emailOtps").doc(requestId);
         const snap = await ref.get();
-        if (!snap.exists) return res.status(400).json({ error: { message: "Invalid requestId" } });
+
+        if (!snap.exists) {
+          return res.status(400).json({ error: { message: "Invalid requestId" } });
+        }
 
         const data = snap.data() || {};
+
         if (data.used) return res.status(400).json({ error: { message: "Code already used" } });
         if (data.email !== email) return res.status(400).json({ error: { message: "Email mismatch" } });
         if (Date.now() > Number(data.expiresAt || 0)) return res.status(400).json({ error: { message: "Code expired" } });
 
-        if (Number(data.attempts || 0) >= 5) return res.status(429).json({ error: { message: "Too many attempts" } });
+        const attempts = Number(data.attempts || 0);
+        if (attempts >= 5) return res.status(429).json({ error: { message: "Too many attempts" } });
 
         const ok = otpHash(email, code, otpSecret) === data.codeHash;
         if (!ok) {
@@ -193,16 +237,29 @@ exports.verifyEmailCode = onRequest(
           return res.status(400).json({ error: { message: "Invalid code" } });
         }
 
-        await ref.update({ used: true, usedAt: admin.firestore.FieldValue.serverTimestamp() });
+        await ref.update({
+          used: true,
+          usedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
 
+        // Ensure Auth user exists + verified
         let user;
         try {
           user = await admin.auth().getUserByEmail(email);
+          // If user exists but not verified, set verified
+          if (!user.emailVerified) {
+            await admin.auth().updateUser(user.uid, { emailVerified: true });
+            user = await admin.auth().getUser(user.uid);
+          }
         } catch (e) {
           user = await admin.auth().createUser({ email, emailVerified: true });
         }
 
-        const token = await admin.auth().createCustomToken(user.uid, { emailVerifiedByOtp: true });
+        // Create custom token so client can sign in with it
+        const token = await admin.auth().createCustomToken(user.uid, {
+          emailVerifiedByOtp: true,
+        });
+
         return res.status(200).json({ success: true, uid: user.uid, token });
       } catch (err) {
         console.error("verifyEmailCode error:", err);
