@@ -242,25 +242,8 @@ exports.verifyEmailCode = onRequest(
           usedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        // Ensure Auth user exists + verified
-        let user;
-        try {
-          user = await admin.auth().getUserByEmail(email);
-          // If user exists but not verified, set verified
-          if (!user.emailVerified) {
-            await admin.auth().updateUser(user.uid, { emailVerified: true });
-            user = await admin.auth().getUser(user.uid);
-          }
-        } catch (e) {
-          user = await admin.auth().createUser({ email, emailVerified: true });
-        }
-
-        // Create custom token so client can sign in with it
-        const token = await admin.auth().createCustomToken(user.uid, {
-          emailVerifiedByOtp: true,
-        });
-
-        return res.status(200).json({ success: true, uid: user.uid, token });
+        // OTP verified — app handles account creation itself (createUserWithEmailAndPassword)
+        return res.status(200).json({ success: true });
       } catch (err) {
         console.error("verifyEmailCode error:", err);
         return res.status(500).json({ error: { message: err.message || "Verification failed" } });
@@ -2326,6 +2309,225 @@ exports.notifyUniclubJoinDecision = onValueCreated(
     }
   }
 );
+// ========== Password Reset: Send OTP ==========
+exports.sendPasswordResetOtp = onRequest(
+  {
+    region: "us-central1",
+    secrets: [SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, OTP_SECRET],
+  },
+  (req, res) => {
+    cors(req, res, async () => {
+      try {
+        if (req.method === "OPTIONS") return res.status(204).send("");
+        if (req.method !== "POST") {
+          return res.status(405).json({ error: { message: "Method Not Allowed" } });
+        }
+
+        const email = String(req.body.email || "").toLowerCase().trim();
+        if (!validateEmail(email)) {
+          return res.status(400).json({ error: { message: "Invalid email address" } });
+        }
+
+        // Verify the user exists in Firebase Auth before sending a code
+        // (return generic success to avoid user-enumeration)
+        try {
+          await admin.auth().getUserByEmail(email);
+        } catch (e) {
+          console.log("[sendPasswordResetOtp] email not found in Auth (silent):", email);
+          return res.status(200).json({ success: true, requestId: "noop" });
+        }
+
+        const code = String(Math.floor(100000 + Math.random() * 900000));
+        const requestId = crypto.randomUUID();
+        const otpSecret = OTP_SECRET.value();
+        if (!otpSecret) throw new Error("OTP_SECRET not configured");
+
+        const codeHash = otpHash(email, code, otpSecret);
+        const expiresAt = Date.now() + 20 * 60 * 1000; // 20 minutes
+
+        await fsdb.collection("passwordResetOtps").doc(requestId).set({
+          email,
+          codeHash,
+          expiresAt,
+          attempts: 0,
+          used: false,
+          verified: false,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        const transporter = getSmtpTransporter();
+        await withTimeout(transporter.verify(), 8000, "SMTP verify timeout");
+        await withTimeout(
+          transporter.sendMail({
+            from: `MyMor <${SMTP_USER.value()}>`,
+            to: email,
+            subject: "Reset your MyMor password",
+            text: [
+              `Your MyMor password reset code is: ${code}`,
+              "",
+              "This code expires in 20 minutes.",
+              "If you did not request a password reset, please ignore this email.",
+            ].join("\n"),
+          }),
+          15000,
+          "SMTP send timeout"
+        );
+
+        console.log("[sendPasswordResetOtp] OTP sent to:", email);
+        return res.status(200).json({ success: true, requestId });
+      } catch (err) {
+        console.error("[sendPasswordResetOtp] error:", err);
+        return res.status(500).json({ error: { message: err.message || "Failed to send reset code" } });
+      }
+    });
+  }
+);
+
+// ========== Password Reset: Verify OTP (step 2 — confirm code is correct) ==========
+exports.verifyPasswordResetOtp = onRequest(
+  { region: "us-central1", secrets: [OTP_SECRET] },
+  (req, res) => {
+    cors(req, res, async () => {
+      try {
+        if (req.method === "OPTIONS") return res.status(204).send("");
+        if (req.method !== "POST") {
+          return res.status(405).json({ error: { message: "Method Not Allowed" } });
+        }
+
+        const email = String(req.body.email || "").toLowerCase().trim();
+        const code = String(req.body.code || "").trim();
+        const requestId = String(req.body.requestId || "").trim();
+
+        if (!validateEmail(email) || code.length !== 6 || !requestId) {
+          return res.status(400).json({ error: { message: "Invalid payload" } });
+        }
+
+        const otpSecret = OTP_SECRET.value();
+        if (!otpSecret) throw new Error("OTP_SECRET not configured");
+
+        const ref = fsdb.collection("passwordResetOtps").doc(requestId);
+        const snap = await ref.get();
+
+        if (!snap.exists) {
+          return res.status(400).json({ error: { message: "Invalid request ID" } });
+        }
+
+        const data = snap.data() || {};
+
+        if (data.used) return res.status(400).json({ error: { message: "Code already used" } });
+        if (data.email !== email) return res.status(400).json({ error: { message: "Email mismatch" } });
+        if (Date.now() > Number(data.expiresAt || 0)) {
+          return res.status(400).json({ error: { message: "Code expired" } });
+        }
+
+        const attempts = Number(data.attempts || 0);
+        if (attempts >= 5) {
+          return res.status(429).json({ error: { message: "Too many attempts. Request a new code." } });
+        }
+
+        const ok = otpHash(email, code, otpSecret) === data.codeHash;
+        if (!ok) {
+          await ref.update({ attempts: admin.firestore.FieldValue.increment(1) });
+          return res.status(400).json({ error: { message: "Incorrect code. Please try again." } });
+        }
+
+        // Mark as verified — the actual password update happens in step 3
+        await ref.update({ verified: true });
+
+        return res.status(200).json({ success: true });
+      } catch (err) {
+        console.error("[verifyPasswordResetOtp] error:", err);
+        return res.status(500).json({ error: { message: err.message || "Verification failed" } });
+      }
+    });
+  }
+);
+
+// ========== Password Reset: Set new password (step 3 — update via Admin SDK) ==========
+exports.verifyOtpAndResetPassword = onRequest(
+  { region: "us-central1", secrets: [OTP_SECRET] },
+  (req, res) => {
+    cors(req, res, async () => {
+      try {
+        if (req.method === "OPTIONS") return res.status(204).send("");
+        if (req.method !== "POST") {
+          return res.status(405).json({ error: { message: "Method Not Allowed" } });
+        }
+
+        const email = String(req.body.email || "").toLowerCase().trim();
+        const code = String(req.body.code || "").trim();
+        const requestId = String(req.body.requestId || "").trim();
+        const newPassword = String(req.body.newPassword || "");
+
+        if (!validateEmail(email) || code.length !== 6 || !requestId) {
+          return res.status(400).json({ error: { message: "Invalid payload" } });
+        }
+        if (!newPassword || newPassword.length < 8) {
+          return res.status(400).json({ error: { message: "Password must be at least 8 characters" } });
+        }
+
+        const otpSecret = OTP_SECRET.value();
+        if (!otpSecret) throw new Error("OTP_SECRET not configured");
+
+        const ref = fsdb.collection("passwordResetOtps").doc(requestId);
+        const snap = await ref.get();
+
+        if (!snap.exists) {
+          return res.status(400).json({ error: { message: "Invalid request ID" } });
+        }
+
+        const data = snap.data() || {};
+
+        if (data.used) {
+          return res.status(400).json({ error: { message: "This reset code has already been used" } });
+        }
+        if (data.email !== email) {
+          return res.status(400).json({ error: { message: "Email mismatch" } });
+        }
+        if (Date.now() > Number(data.expiresAt || 0)) {
+          return res.status(400).json({ error: { message: "Code expired. Please request a new one." } });
+        }
+
+        // Accept if already verified in step 2, otherwise re-verify the code
+        const alreadyVerified = data.verified === true;
+        if (!alreadyVerified) {
+          const attempts = Number(data.attempts || 0);
+          if (attempts >= 5) {
+            return res.status(429).json({ error: { message: "Too many attempts. Request a new code." } });
+          }
+          const ok = otpHash(email, code, otpSecret) === data.codeHash;
+          if (!ok) {
+            await ref.update({ attempts: admin.firestore.FieldValue.increment(1) });
+            return res.status(400).json({ error: { message: "Incorrect code" } });
+          }
+        }
+
+        // Look up the Firebase Auth user and update their password via Admin SDK
+        let userRecord;
+        try {
+          userRecord = await admin.auth().getUserByEmail(email);
+        } catch (e) {
+          return res.status(404).json({ error: { message: "No account found with this email" } });
+        }
+
+        await admin.auth().updateUser(userRecord.uid, { password: newPassword });
+
+        // Mark OTP as used so it cannot be replayed
+        await ref.update({
+          used: true,
+          usedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        console.log("[verifyOtpAndResetPassword] password reset for uid:", userRecord.uid);
+        return res.status(200).json({ success: true });
+      } catch (err) {
+        console.error("[verifyOtpAndResetPassword] error:", err);
+        return res.status(500).json({ error: { message: err.message || "Password reset failed" } });
+      }
+    });
+  }
+);
+
 // ✅ Mentions notification (RTDB v2)
 exports.notifyMentionedUsers = onValueCreated(
   "/social/{groupId}/{postId}",
