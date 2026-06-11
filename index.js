@@ -1,9 +1,8 @@
 /* eslint-disable */
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
-const { onValueCreated } = require("firebase-functions/v2/database");
 const { onDocumentUpdated, onDocumentCreated } = require("firebase-functions/v2/firestore");
-const { getDatabase } = require("firebase-admin/database");
+const { getFirestore } = require("firebase-admin/firestore");
 const { onRequest } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret } = require("firebase-functions/params");
@@ -13,9 +12,9 @@ const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
 admin.initializeApp();
-const db = getDatabase();
-const fsdb = admin.firestore();
-const rtdb = admin.database();
+// All data lives in the Australian Firestore database
+const db = getFirestore(admin.app(), "mymor-australia");
+
 // ========== Email ==========
 
 const SMTP_HOST = defineSecret("SMTP_HOST");
@@ -24,28 +23,6 @@ const SMTP_USER = defineSecret("SMTP_USER");
 const SMTP_PASS = defineSecret("SMTP_PASS");
 const OTP_SECRET = defineSecret("OTP_SECRET");
 
-// const transporter = nodemailer.createTransport({
-//   host: "smtpout.secureserver.net",
-//   port: 465,
-//   secure: true, // 465 true
-//   auth: {
-//     user: "mymor@mymor.com", // mymor@mymor.com
-//     pass: "Ilovemymor@22", // app password
-//   },
-//   //otp:"9f09c409f769e34c27d1e1bae339f5ab9aa9f7c9680b0378c1891d5c2d1e4188",
-//   // host: "smtp.gmail.com",
-//   // port: 465,
-//   // secure: true, // 465 true
-//   // auth: {
-//   //   user: "mymor@mymor.com", // mymor@mymor.com
-//   //   pass: "xggf umkg lpwk kbqn", // app password
-//   // },
-//   // service: "gmail",
-//   // auth: {
-//   //   user: "chiggy14@gmail.com",
-//   //   pass: "xggf umkg lpwk kbqn",
-//   // },
-// });
 function withTimeout(promise, ms, label = "timeout") {
   return Promise.race([
     promise,
@@ -81,56 +58,13 @@ function getSmtpTransporter() {
       user: SMTP_USER.value(),
       pass: SMTP_PASS.value(),
     },
-    pool: true, 
+    pool: true,
     maxConnections: 1,
     maxMessages: 5,
   });
 
   return smtpTransporter;
 }
-
-
-// exports.sendVerificationCode = functions.https.onRequest(async (req, res) => {
-//   if (req.method !== "POST") {
-//     return res.status(405).json({ error: "Method Not Allowed" });
-//   }
-
-//   const { email } = req.body;
-//   console.log("Received email:", email);
-
-//   if (!email || !validateEmail(email)) {
-//     return res.status(400).json({
-//       error: { message: "Invalid or missing email", status: "INVALID_ARGUMENT" },
-//     });
-//   }
-
-//   const code = Math.floor(100000 + Math.random() * 900000).toString();
-
-//   await admin
-//     .firestore()
-//     .collection("emailVerifications")
-//     .doc(email)
-//     .set({
-//       code,
-//       expiresAt: Date.now() + 5 * 60 * 1000,
-//     });
-
-//   const msg = {
-//     to: email,
-//     from: "chiggy14@gmaill.com",
-//     subject: "Your Verification Code",
-//     text: `Your verification code is ${code}`,
-//   };
-
-//   try {
-//     await transporter.sendMail(msg);
-//     res.json({ success: true, message: `Verification code sent to ${email}` });
-//     return { success: true, message: "Code sent." };
-//   } catch (error) {
-//     console.error("Error sending email:", error);
-//     throw new functions.https.HttpsError("internal", "Failed to send email.");
-//   }
-// });
 
 exports.sendVerificationCode = onRequest(
   {
@@ -160,8 +94,8 @@ exports.sendVerificationCode = onRequest(
         const codeHash = otpHash(email, code, otpSecret);
         const expiresAt = Date.now() + 5 * 60 * 1000; // 5 min
 
-        // Save OTP in Firestore
-        await fsdb.collection("emailOtps").doc(requestId).set({
+        // Save OTP in Firestore (mymor-australia)
+        await db.collection("emailOtps").doc(requestId).set({
           email,
           codeHash,
           expiresAt,
@@ -215,7 +149,7 @@ exports.verifyEmailCode = onRequest(
         const otpSecret = OTP_SECRET.value();
         if (!otpSecret) throw new Error("OTP_SECRET not configured");
 
-        const ref = fsdb.collection("emailOtps").doc(requestId);
+        const ref = db.collection("emailOtps").doc(requestId);
         const snap = await ref.get();
 
         if (!snap.exists) {
@@ -252,57 +186,228 @@ exports.verifyEmailCode = onRequest(
   }
 );
 
+// ========== FCM Token helpers (Firestore-backed) ==========
+
+/**
+ * Get all FCM tokens for every user in a hostel, optionally excluding one uid.
+ * Firestore path: hostelTokens/{hostelid}/tokens/{uid}
+ */
 async function tokensForHostel(hostelid, excludeUid = null) {
   if (!hostelid) return [];
-  const snap = await db.ref(`/hostelTokens/${hostelid}`).once("value");
-  if (!snap.exists()) return [];
+  const snap = await db
+    .collection("hostelTokens")
+    .doc(hostelid)
+    .collection("tokens")
+    .get();
 
   const tokens = [];
-  snap.forEach((child) => {
-    // child.key is uid; child.val() can be a string token or object with token(s)
-    if (excludeUid && child.key === String(excludeUid)) return;
-    const v = child.val();
-    if (!v) return;
-
-    if (typeof v === "string") {
-      tokens.push(v);
-    } else if (Array.isArray(v)) {
-      tokens.push(...v.filter(Boolean));
-    } else if (typeof v === "object") {
-      if (v.token) tokens.push(v.token);
-      if (Array.isArray(v.tokens)) tokens.push(...v.tokens.filter(Boolean));
-      Object.values(v).forEach((maybe) => {
-        if (typeof maybe === "string") tokens.push(maybe);
-        if (Array.isArray(maybe)) tokens.push(...maybe.filter(Boolean));
-      });
-    }
+  snap.forEach((doc) => {
+    if (excludeUid && doc.id === String(excludeUid)) return;
+    const v = doc.data() || {};
+    if (v.token) tokens.push(v.token);
+    if (Array.isArray(v.tokens)) tokens.push(...v.tokens.filter(Boolean));
   });
 
-  // dedupe
   return Array.from(new Set(tokens.filter(Boolean)));
 }
-// Collect tokens for all members of a group (excluding sender), deduped
+
+/**
+ * Get FCM tokens for a specific user scoped to a hostel.
+ * Firestore path: hostelTokens/{hostelid}/tokens/{uid}
+ */
+async function tokensForUser(hostelid, uid) {
+  if (!hostelid || !uid) return [];
+  const docSnap = await db
+    .collection("hostelTokens")
+    .doc(hostelid)
+    .collection("tokens")
+    .doc(uid)
+    .get();
+
+  if (!docSnap.exists) return [];
+  const v = docSnap.data() || {};
+  let tokens = [];
+  if (v.token) tokens.push(v.token);
+  if (Array.isArray(v.tokens)) tokens.push(...v.tokens);
+  return Array.from(new Set(tokens.filter(Boolean)));
+}
+
+/**
+ * Get FCM tokens for all members of a group (excluding sender).
+ * Firestore path: groups/{groupId}/members/{uid}
+ */
 async function tokensForGroupMembers(hostelid, groupId, excludeUid = null) {
-  // members live in RTDB: /groups/{groupId}/members
-  const snap = await db.ref(`/groups/${groupId}/members`).once("value");
-  const members = snap.val() || {};
+  const snap = await db
+    .collection("groups")
+    .doc(groupId)
+    .collection("members")
+    .get();
 
-  // member keys are user UIDs in your schema
-  const memberUids = Object.keys(members).filter((uid) => uid && uid !== String(excludeUid));
+  const memberUids = [];
+  snap.forEach((doc) => {
+    if (doc.id && doc.id !== String(excludeUid)) memberUids.push(doc.id);
+  });
 
-  // gather tokens per member (scoped to hostel)
-  const tokenSets = await Promise.all(memberUids.map((uid) => tokensForUser(hostelid, uid)));
+  const tokenSets = await Promise.all(
+    memberUids.map((uid) => tokensForUser(hostelid, uid))
+  );
   const all = tokenSets.flat().filter(Boolean);
-
-  // dedupe
   return Array.from(new Set(all));
 }
+
+/**
+ * Get FCM tokens for a user by their uid (not hostel-scoped).
+ * Firestore path: userTokens/{uid}
+ */
+async function tokensForUserId(uid) {
+  if (!uid) return [];
+  const docSnap = await db.collection("userTokens").doc(uid).get();
+  if (!docSnap.exists) return [];
+  const v = docSnap.data() || {};
+  let tokens = [];
+  if (v.token) tokens.push(v.token);
+  if (Array.isArray(v.tokens)) tokens.push(...v.tokens.filter(Boolean));
+  // also collect any string values directly on the doc
+  Object.values(v).forEach((maybe) => {
+    if (typeof maybe === "string" && maybe) tokens.push(maybe);
+    if (Array.isArray(maybe)) tokens.push(...maybe.filter(Boolean));
+  });
+  return Array.from(new Set(tokens.filter(Boolean)));
+}
+
+// ========== Notification Settings helpers ==========
+
+/**
+ * Load a user's notification settings from Firestore.
+ * Firestore path: notificationSettings/{uid}
+ */
+async function getUserNotificationSettings(uid) {
+  const docSnap = await db.collection("notificationSettings").doc(uid).get();
+  const val = docSnap.exists ? docSnap.data() || {} : {};
+
+  const globalEnabled =
+    !val.global || val.global.enabled !== false; // default: true
+
+  const channels = val.channels || {};
+  const mutedGroups = val.mutedGroups || {};
+
+  return { globalEnabled, channels, mutedGroups };
+}
+
+async function isNotificationsEnabledFor(uid, opts) {
+  const { channel, groupId, communityId, discoverGroupId } = opts || {};
+  const s = await getUserNotificationSettings(uid);
+
+  // 1) Global switch
+  if (!s.globalEnabled) return false;
+
+  // 2) Channel switch (if explicitly false then off)
+  if (
+    channel &&
+    Object.prototype.hasOwnProperty.call(s.channels, channel) &&
+    s.channels[channel] === false
+  ) {
+    return false;
+  }
+
+  // 3) Per-group mute
+  const mg = s.mutedGroups || {};
+
+  if (channel === "chat" && groupId) {
+    if (mg.chat && mg.chat[groupId] && mg.chat[groupId].muted) return false;
+  }
+
+  if (channel === "community" && communityId) {
+    if (mg.community && mg.community[communityId] && mg.community[communityId].muted)
+      return false;
+  }
+
+  if (channel === "discoverAnnouncements" && discoverGroupId) {
+    if (
+      mg.discover &&
+      mg.discover[discoverGroupId] &&
+      mg.discover[discoverGroupId].muted
+    )
+      return false;
+  }
+
+  return true;
+}
+
+/**
+ * Collect tokens for discover-group announcement recipients (respects mute settings).
+ * Firestore path: discovergroup/{groupId}/members/{uid}
+ */
+async function tokensForDiscoverGroupMembersWithSettings(groupId, senderUid) {
+  if (!groupId) return [];
+
+  const snap = await db
+    .collection("discovergroup")
+    .doc(groupId)
+    .collection("members")
+    .get();
+
+  const memberUids = [];
+  snap.forEach((doc) => {
+    if (doc.id && doc.id !== String(senderUid)) memberUids.push(doc.id);
+  });
+  if (!memberUids.length) return [];
+
+  const tokenSets = await Promise.all(
+    memberUids.map(async (uid) => {
+      const enabled = await isNotificationsEnabledFor(uid, {
+        channel: "discoverAnnouncements",
+        discoverGroupId: groupId,
+      });
+      if (!enabled) return [];
+      return tokensForUserId(uid);
+    })
+  );
+
+  const all = tokenSets.flat().filter(Boolean);
+  return Array.from(new Set(all));
+}
+
+/**
+ * Collect tokens for discover-group chat recipients (respects mute settings).
+ * Firestore path: discovergroup/{groupId}/members/{uid}
+ */
+async function tokensForDiscoverGroupChatMembers(groupId, senderUid) {
+  if (!groupId) return [];
+
+  const snap = await db
+    .collection("discovergroup")
+    .doc(groupId)
+    .collection("members")
+    .get();
+
+  const memberUids = [];
+  snap.forEach((doc) => {
+    if (doc.id && doc.id !== String(senderUid)) memberUids.push(doc.id);
+  });
+  if (!memberUids.length) return [];
+
+  const tokenSets = await Promise.all(
+    memberUids.map(async (uid) => {
+      const enabled = await isNotificationsEnabledFor(uid, {
+        channel: "chat",
+        groupId,
+      });
+      if (!enabled) return [];
+      return tokensForUserId(uid);
+    })
+  );
+
+  const all = tokenSets.flat().filter(Boolean);
+  return Array.from(new Set(all));
+}
+
 // ========== Group chat ==========
-exports.sendGroupMessageNotification = onValueCreated(
-  "/messages/{groupId}/{messageId}",
+exports.sendGroupMessageNotification = onDocumentCreated(
+  { document: "groups/{groupId}/messages/{messageId}", database: "mymor-australia" },
   async (event) => {
     const { groupId } = event.params;
-    const messageData = event.data.val() || {};
+    const messageData = event.data.data() || {};
 
     const groupName = messageData.groupName || "";
     const senderId = messageData.senderId || "";
@@ -311,15 +416,14 @@ exports.sendGroupMessageNotification = onValueCreated(
     const type = messageData.type || "";
     const posterUrl = messageData.posterUrl || "";
 
-    // Resolve hostelid (prefer message, fallback to group)
+    // Resolve hostelid (prefer message, fallback to group doc)
     let hostelid = messageData.hostelid;
     if (!hostelid) {
-      const gSnap = await db.ref(`/groups/${groupId}`).once("value");
-      const gVal = gSnap.val() || {};
-      hostelid = gVal.hostelid || "";
+      const gSnap = await db.collection("groups").doc(groupId).get();
+      hostelid = (gSnap.data() || {}).hostelid || "";
     }
 
-    // === NEW: only notify group members (exclude sender) ===
+    // Only notify group members (exclude sender)
     const tokens = await tokensForGroupMembers(hostelid, groupId, senderId);
     if (!tokens.length) {
       console.log("[sendGroupMessageNotification] No member tokens found");
@@ -330,15 +434,13 @@ exports.sendGroupMessageNotification = onValueCreated(
       !type || type === "text"
         ? `${senderName}: ${messageText || "Sent a message"}`
         : `${senderName} ${{
-          image: "sent an image",
-          audio: "sent a voice message",
-          video: "sent a video",
-          event: "created an event",
-          poll: "created a poll",
-        }[type] || "sent a message"
-        }`;
+            image: "sent an image",
+            audio: "sent a voice message",
+            video: "sent a video",
+            event: "created an event",
+            poll: "created a poll",
+          }[type] || "sent a message"}`;
 
-    // Prepare payload (keep your data keys)
     const base = {
       notification: { title: groupName || "New message", body },
       data: {
@@ -355,21 +457,20 @@ exports.sendGroupMessageNotification = onValueCreated(
       },
     };
 
-    // FCM supports up to 500 tokens per multicast call—chunk defensively
     const chunkSize = 500;
-    const chunks = [];
-    for (let i = 0; i < tokens.length; i += chunkSize) {
-      chunks.push(tokens.slice(i, i + chunkSize));
-    }
-
     try {
-      let success = 0, failure = 0;
-      for (const chunk of chunks) {
-        const resp = await admin.messaging().sendEachForMulticast({ tokens: chunk, ...base });
+      let success = 0,
+        failure = 0;
+      for (let i = 0; i < tokens.length; i += chunkSize) {
+        const resp = await admin
+          .messaging()
+          .sendEachForMulticast({ tokens: tokens.slice(i, i + chunkSize), ...base });
         success += resp.successCount;
         failure += resp.failureCount;
       }
-      console.log(`[sendGroupMessageNotification] Sent to members: success=${success} failure=${failure} total=${tokens.length}`);
+      console.log(
+        `[sendGroupMessageNotification] success=${success} failure=${failure} total=${tokens.length}`
+      );
       return { success, failure, total: tokens.length };
     } catch (error) {
       console.error("[sendGroupMessageNotification] FCM error:", error);
@@ -377,11 +478,15 @@ exports.sendGroupMessageNotification = onValueCreated(
     }
   }
 );
+
 // ========== Announcements: comment ==========
-exports.sendAnnouncementsCommentNotification = onValueCreated(
-  "/announcements/{announcementId}/comments/{commentId}",
+exports.sendAnnouncementsCommentNotification = onDocumentCreated(
+  {
+    document: "announcements/{announcementId}/comments/{commentId}",
+    database: "mymor-australia",
+  },
   async (event) => {
-    const comment = event.data.val() || {};
+    const comment = event.data.data() || {};
     const { announcementId } = event.params;
     const title = comment.title;
     const senderId = comment.senderId;
@@ -389,9 +494,10 @@ exports.sendAnnouncementsCommentNotification = onValueCreated(
     const messageText = comment.content || "";
 
     const announcementSnap = await db
-      .ref(`/announcements/${announcementId}`)
+      .collection("announcements")
+      .doc(announcementId)
       .get();
-    const announcement = announcementSnap.val();
+    const announcement = announcementSnap.data() || {};
 
     if (!announcement || senderId === announcement.userId) return null;
 
@@ -428,11 +534,16 @@ exports.sendAnnouncementsCommentNotification = onValueCreated(
     }
   }
 );
+
 // ========== Announcements: reply ==========
-exports.sendAnnouncementsReplyNotification = onValueCreated(
-  "/announcements/{announcementId}/comments/{commentId}/replies/{replyId}",
+exports.sendAnnouncementsReplyNotification = onDocumentCreated(
+  {
+    document:
+      "announcements/{announcementId}/comments/{commentId}/replies/{replyId}",
+    database: "mymor-australia",
+  },
   async (event) => {
-    const reply = event.data.val() || {};
+    const reply = event.data.data() || {};
     const { announcementId, commentId } = event.params;
     const title = reply.title;
     const senderId = reply.senderId;
@@ -440,17 +551,20 @@ exports.sendAnnouncementsReplyNotification = onValueCreated(
     const messageText = reply.content || "";
 
     const commentSnap = await db
-      .ref(`/announcements/${announcementId}/comments/${commentId}`)
+      .collection("announcements")
+      .doc(announcementId)
+      .collection("comments")
+      .doc(commentId)
       .get();
-    const comment = commentSnap.val();
+    const comment = commentSnap.data() || {};
     if (!comment || senderId === comment.uid) return null;
 
-    const annSnap = await db.ref(`/announcements/${announcementId}`).get();
-    const announcement = annSnap.val();
+    const annSnap = await db.collection("announcements").doc(announcementId).get();
+    const announcement = annSnap.data() || {};
 
     const hostelid = announcement.hostelid;
     const tokens = await tokensForHostel(hostelid, senderId);
-    if (!tokens) return null;
+    if (!tokens || !tokens.length) return null;
 
     const payload = {
       notification: {
@@ -482,11 +596,12 @@ exports.sendAnnouncementsReplyNotification = onValueCreated(
     }
   }
 );
+
 // ========== Community: new post ==========
-exports.sendCommunitynNewPostNotification = onValueCreated(
-  "/community/{postId}",
+exports.sendCommunitynNewPostNotification = onDocumentCreated(
+  { document: "community/{postId}", database: "mymor-australia" },
   async (event) => {
-    const post = event.data.val() || {};
+    const post = event.data.data() || {};
     const { postId } = event.params;
     const senderId = post.senderId;
     const senderName = post.sender || "Someone";
@@ -496,7 +611,7 @@ exports.sendCommunitynNewPostNotification = onValueCreated(
 
     const hostelid = post.hostelid;
     const tokens = await tokensForHostel(hostelid, senderId);
-    if (!tokens) return null;
+    if (!tokens || !tokens.length) return null;
 
     const payload = {
       notification: {
@@ -526,22 +641,22 @@ exports.sendCommunitynNewPostNotification = onValueCreated(
 );
 
 // ========== Community: comment ==========
-exports.sendCommunityCommentNotification = onValueCreated(
-  "/community/{postId}/comments/{commentId}",
+exports.sendCommunityCommentNotification = onDocumentCreated(
+  { document: "community/{postId}/comments/{commentId}", database: "mymor-australia" },
   async (event) => {
-    const comment = event.data.val() || {};
+    const comment = event.data.data() || {};
     const { postId } = event.params;
     const senderId = comment.senderId;
     const senderName = comment.sender || "Someone";
     const messageText = comment.content || "";
 
-    const communitySnap = await db.ref(`/community/${postId}`).get();
-    const post = communitySnap.val();
+    const communitySnap = await db.collection("community").doc(postId).get();
+    const post = communitySnap.data() || {};
     if (!post || comment.senderId === post.uid) return null;
 
     const hostelid = post.hostelid;
     const tokens = await tokensForHostel(hostelid, senderId);
-    if (!tokens) return null;
+    if (!tokens || !tokens.length) return null;
 
     const payload = {
       notification: {
@@ -571,27 +686,33 @@ exports.sendCommunityCommentNotification = onValueCreated(
 );
 
 // ========== Community: reply ==========
-exports.sendCommunityReplyNotification = onValueCreated(
-  "/community/{postId}/comments/{commentId}/replies/{replyId}",
+exports.sendCommunityReplyNotification = onDocumentCreated(
+  {
+    document: "community/{postId}/comments/{commentId}/replies/{replyId}",
+    database: "mymor-australia",
+  },
   async (event) => {
-    const reply = event.data.val() || {};
+    const reply = event.data.data() || {};
     const { postId, commentId } = event.params;
     const senderId = reply.senderId;
     const senderName = reply.sender || "Someone";
     const messageText = reply.content || "";
 
     const commentSnap = await db
-      .ref(`/community/${postId}/comments/${commentId}`)
+      .collection("community")
+      .doc(postId)
+      .collection("comments")
+      .doc(commentId)
       .get();
-    const comment = commentSnap.val();
+    const comment = commentSnap.data() || {};
     if (!comment || senderId === comment.uid) return null;
 
-    const postSnap = await db.ref(`/community/${postId}`).get();
-    const post = postSnap.val();
+    const postSnap = await db.collection("community").doc(postId).get();
+    const post = postSnap.data() || {};
 
     const hostelid = post.hostelid;
     const tokens = await tokensForHostel(hostelid, senderId);
-    if (!tokens) return null;
+    if (!tokens || !tokens.length) return null;
 
     const payload = {
       notification: {
@@ -621,9 +742,9 @@ exports.sendCommunityReplyNotification = onValueCreated(
   }
 );
 
-// ========== Dining menu (Firestore) ==========
-exports.sendMenuUpdateNotification = onDocumentUpdated(
-  "menus/{menuDate}",
+// ========== Dining menu: existing entry updated ==========
+exports.sendMenuChangedNotification = onDocumentUpdated(
+  { document: "menus/{menuDate}", database: "mymor-australia" },
   async (event) => {
     const menuDate = event.params.menuDate;
     const beforeData = event.data.before.data() || {};
@@ -669,9 +790,10 @@ exports.sendMenuUpdateNotification = onDocumentUpdated(
     }
   }
 );
+
 // ========== Dining Menu: new upload notification ==========
 exports.sendMenuUpdateNotification = onDocumentCreated(
-  "menus_uploads/{uploadId}",
+  { document: "menus_uploads/{uploadId}", database: "mymor-australia" },
   async (event) => {
     const data = event.data.data() || {};
     const hostelid = data.hostelid;
@@ -726,20 +848,19 @@ exports.sendMenuUpdateNotification = onDocumentCreated(
 
     console.log(
       `[sendMenuUpdateNotification] Sent dining upload notification to hostel=${hostelid}, ` +
-      `createdCount=${createdCount}, success=${success}, failure=${failure}, totalTokens=${tokens.length}`
+        `createdCount=${createdCount}, success=${success}, failure=${failure}, totalTokens=${tokens.length}`
     );
 
     return null;
   }
 );
+
 // ========== Admin HTTP endpoints (unchanged) ==========
 exports.deleteUserByUid = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
     try {
       if (req.method !== "POST") {
-        return res
-          .status(405)
-          .json({ error: "Method Not Allowed. Use POST." });
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
       }
 
       const { uid } = req.body || {};
@@ -757,15 +878,16 @@ exports.deleteUserByUid = functions.https.onRequest((req, res) => {
       if (err.code === "auth/user-not-found") {
         return res.status(404).json({ error: "User not found" });
       }
-
       return res.status(500).json({ error: err.message });
     }
   });
 });
-exports.sendAnnouncementsNewNotification = onValueCreated(
-  "/announcements/{announcementId}",
+
+// ========== Announcements: new announcement ==========
+exports.sendAnnouncementsNewNotification = onDocumentCreated(
+  { document: "announcements/{announcementId}", database: "mymor-australia" },
   async (event) => {
-    const data = event.data.val() || {};
+    const data = event.data.data() || {};
     const senderId = data.uid;
     const senderName = data.user || "Someone";
     const messageText = data.title || "New announcement";
@@ -806,9 +928,7 @@ exports.disableUserByUid = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
     try {
       if (req.method !== "POST") {
-        return res
-          .status(405)
-          .json({ error: "Method Not Allowed. Use POST." });
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
       }
 
       const { uid } = req.body;
@@ -832,9 +952,7 @@ exports.enableUserByUid = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
     try {
       if (req.method !== "POST") {
-        return res
-          .status(405)
-          .json({ error: "Method Not Allowed. Use POST." });
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
       }
 
       const { uid } = req.body;
@@ -895,21 +1013,27 @@ function isSuperadminDoc(d) {
 
 function isSuperadminClaims(claims) {
   claims = claims || {};
-  if (norm(claims.role) === "superadmin" || norm(claims.type) === "superadmin") return true;
+  if (norm(claims.role) === "superadmin" || norm(claims.type) === "superadmin")
+    return true;
 
   if (Array.isArray(claims.roles)) {
     for (var i = 0; i < claims.roles.length; i++) {
       if (norm(claims.roles[i]) === "superadmin") return true;
     }
   }
-  if (claims.roles && typeof claims.roles === "object" && !Array.isArray(claims.roles)) {
+  if (
+    claims.roles &&
+    typeof claims.roles === "object" &&
+    !Array.isArray(claims.roles)
+  ) {
     for (var k in claims.roles) {
       if (Object.prototype.hasOwnProperty.call(claims.roles, k)) {
         if (norm(k) === "superadmin" && !!claims.roles[k]) return true;
       }
     }
   }
-  if (claims.isSuperadmin === true || claims.is_superadmin === true) return true;
+  if (claims.isSuperadmin === true || claims.is_superadmin === true)
+    return true;
   return false;
 }
 
@@ -921,8 +1045,12 @@ async function findSuperadminUIDsByClaims(uids) {
     const users = await Promise.all(
       group.map(function (uid) {
         return auth.getUser(uid).then(
-          function (u) { return u; },
-          function () { return null; }
+          function (u) {
+            return u;
+          },
+          function () {
+            return null;
+          }
         );
       })
     );
@@ -931,20 +1059,26 @@ async function findSuperadminUIDsByClaims(uids) {
         result.add(u.uid);
       }
     });
-    await new Promise(function (r) { setTimeout(r, 100); });
+    await new Promise(function (r) {
+      setTimeout(r, 100);
+    });
   }
   return result;
 }
 
 function toUidSet(arr) {
   if (!Array.isArray(arr)) return new Set();
-  return new Set(arr.map(function (x) { return String(x).trim(); }).filter(Boolean));
+  return new Set(
+    arr.map(function (x) {
+      return String(x).trim();
+    }).filter(Boolean)
+  );
 }
 
 // Collect employees linked to a hostel across common schema variants
 async function collectEmployeesForHostel(hostelid) {
-  const col = fsdb.collection(EMP_COLLECTION);
-  const hostRef = fsdb.collection("hostel").doc(hostelid);
+  const col = db.collection(EMP_COLLECTION);
+  const hostRef = db.collection("hostel").doc(hostelid);
 
   const seen = new Set();
   const docs = [];
@@ -960,7 +1094,10 @@ async function collectEmployeesForHostel(hostelid) {
         }
       });
     } catch (e) {
-      console.warn("collectEmployeesForHostel query skipped:", e && e.message ? e.message : String(e));
+      console.warn(
+        "collectEmployeesForHostel query skipped:",
+        e && e.message ? e.message : String(e)
+      );
     }
   }
 
@@ -975,10 +1112,14 @@ async function collectEmployeesForHostel(hostelid) {
 }
 
 // ---------- endpoints (v1) ----------
-exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req, res) {
+exports.disableHostelAndLockEmployees = functions.https.onRequest(function (
+  req,
+  res
+) {
   cors(req, res, async function () {
     try {
-      if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed. Use POST." });
+      if (req.method !== "POST")
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
 
       const body = req.body || {};
       const hostelid = body.hostelid;
@@ -986,19 +1127,21 @@ exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req,
       const excludeUids = Array.isArray(body.excludeUids) ? body.excludeUids : [];
 
       if (!hostelid || typeof hostelid !== "string") {
-        return res.status(400).json({ error: "Request must include { hostelid: <string> }" });
+        return res
+          .status(400)
+          .json({ error: "Request must include { hostelid: <string> }" });
       }
 
       const FieldValue = admin.firestore.FieldValue;
       const skipUidSet = toUidSet(excludeUids);
 
       // 1) Mark hostel disabled
-      await fsdb.collection("hostel").doc(hostelid).set(
+      await db.collection("hostel").doc(hostelid).set(
         {
           active: false,
           lockedAt: FieldValue.serverTimestamp(),
           lockedBy: "http",
-          disabledReason: reason
+          disabledReason: reason,
         },
         { merge: true }
       );
@@ -1006,17 +1149,22 @@ exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req,
       // 2) Collect employees
       let empDocs = await collectEmployeesForHostel(hostelid);
 
-      // Build uid list from DOC IDs (doc.id === Auth UID)
       let uids = [];
       let skippedSuperadmins = 0;
       let skippedByUid = 0;
 
       empDocs = empDocs.filter(function (docSnap) {
         const d = docSnap.data() || {};
-        const duid = String(docSnap.id); // <-- use doc id as UID
+        const duid = String(docSnap.id);
 
-        if (skipUidSet.has(duid)) { skippedByUid++; return false; }
-        if (isSuperadminDoc(d)) { skippedSuperadmins++; return false; }
+        if (skipUidSet.has(duid)) {
+          skippedByUid++;
+          return false;
+        }
+        if (isSuperadminDoc(d)) {
+          skippedSuperadmins++;
+          return false;
+        }
 
         uids.push(duid);
         return true;
@@ -1025,20 +1173,23 @@ exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req,
       // claims-level skip
       const claimSupers = await findSuperadminUIDsByClaims(uids);
       if (claimSupers.size) {
-        claimSupers.forEach(function (uid) { skipUidSet.add(uid); });
+        claimSupers.forEach(function (uid) {
+          skipUidSet.add(uid);
+        });
         skippedSuperadmins += claimSupers.size;
 
         empDocs = empDocs.filter(function (ds) {
-          const duid2 = String(ds.id);
-          return !skipUidSet.has(duid2);
+          return !skipUidSet.has(String(ds.id));
         });
-        uids = uids.filter(function (uid) { return !skipUidSet.has(uid); });
+        uids = uids.filter(function (uid) {
+          return !skipUidSet.has(uid);
+        });
       }
 
       // 3) Firestore batched updates
       let fsCount = 0;
       for (const group of chunk(empDocs, 450)) {
-        const batch = fsdb.batch();
+        const batch = db.batch();
         group.forEach(function (ds) {
           batch.set(
             ds.ref,
@@ -1046,7 +1197,7 @@ exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req,
               active: false,
               lockedAt: FieldValue.serverTimestamp(),
               lockedBy: "http",
-              lockedNote: reason
+              lockedNote: reason,
             },
             { merge: true }
           );
@@ -1063,18 +1214,36 @@ exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req,
             return admin
               .auth()
               .updateUser(uid, { disabled: true })
-              .then(function () { authCount++; })
+              .then(function () {
+                authCount++;
+              })
               .catch(function (e) {
-                console.error("Auth disable failed for", uid, e && e.message ? e.message : String(e));
+                console.error(
+                  "Auth disable failed for",
+                  uid,
+                  e && e.message ? e.message : String(e)
+                );
               });
           })
         );
-        await new Promise(function (r) { setTimeout(r, 150); });
+        await new Promise(function (r) {
+          setTimeout(r, 150);
+        });
       }
 
-      console.log("[disableHostelAndLockEmployees]",
-        "hostel:", hostelid, "docs:", empDocs.length, "uids:", uids.length,
-        "skippedSuperadmins:", skippedSuperadmins, "skippedByUid:", skippedByUid);
+      console.log(
+        "[disableHostelAndLockEmployees]",
+        "hostel:",
+        hostelid,
+        "docs:",
+        empDocs.length,
+        "uids:",
+        uids.length,
+        "skippedSuperadmins:",
+        skippedSuperadmins,
+        "skippedByUid:",
+        skippedByUid
+      );
 
       return res.status(200).json({
         success: true,
@@ -1082,11 +1251,16 @@ exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req,
         firestoreUpdatedEmployees: fsCount,
         authDisabledUsers: authCount,
         skippedSuperadmins: skippedSuperadmins,
-        skippedByUid: skippedByUid
+        skippedByUid: skippedByUid,
       });
     } catch (err) {
-      console.error("disableHostelAndLockEmployees error:", err && err.message ? err.message : String(err));
-      return res.status(500).json({ error: err && err.message ? err.message : "Internal error" });
+      console.error(
+        "disableHostelAndLockEmployees error:",
+        err && err.message ? err.message : String(err)
+      );
+      return res.status(500).json({
+        error: err && err.message ? err.message : "Internal error",
+      });
     }
   });
 });
@@ -1094,7 +1268,8 @@ exports.disableHostelAndLockEmployees = functions.https.onRequest(function (req,
 exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res) {
   cors(req, res, async function () {
     try {
-      if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed. Use POST." });
+      if (req.method !== "POST")
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
 
       const body = req.body || {};
       const hostelid = body.hostelid;
@@ -1102,19 +1277,21 @@ exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res)
       const excludeUids = Array.isArray(body.excludeUids) ? body.excludeUids : [];
 
       if (!hostelid || typeof hostelid !== "string") {
-        return res.status(400).json({ error: "Request must include { hostelid: <string> }" });
+        return res
+          .status(400)
+          .json({ error: "Request must include { hostelid: <string> }" });
       }
 
       const FieldValue = admin.firestore.FieldValue;
       const skipUidSet = toUidSet(excludeUids);
 
       // 1) Mark hostel enabled
-      await fsdb.collection("hostel").doc(hostelid).set(
+      await db.collection("hostel").doc(hostelid).set(
         {
           active: true,
           unlockedAt: FieldValue.serverTimestamp(),
           unlockedBy: "http",
-          enabledReason: reason
+          enabledReason: reason,
         },
         { merge: true }
       );
@@ -1128,10 +1305,16 @@ exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res)
 
       empDocs = empDocs.filter(function (docSnap) {
         const d = docSnap.data() || {};
-        const duid = String(docSnap.id); // <-- use doc id as UID
+        const duid = String(docSnap.id);
 
-        if (skipUidSet.has(duid)) { skippedByUid++; return false; }
-        if (isSuperadminDoc(d)) { skippedSuperadmins++; return false; }
+        if (skipUidSet.has(duid)) {
+          skippedByUid++;
+          return false;
+        }
+        if (isSuperadminDoc(d)) {
+          skippedSuperadmins++;
+          return false;
+        }
 
         uids.push(duid);
         return true;
@@ -1139,20 +1322,23 @@ exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res)
 
       const claimSupers = await findSuperadminUIDsByClaims(uids);
       if (claimSupers.size) {
-        claimSupers.forEach(function (uid) { skipUidSet.add(uid); });
+        claimSupers.forEach(function (uid) {
+          skipUidSet.add(uid);
+        });
         skippedSuperadmins += claimSupers.size;
 
         empDocs = empDocs.filter(function (ds) {
-          const duid2 = String(ds.id);
-          return !skipUidSet.has(duid2);
+          return !skipUidSet.has(String(ds.id));
         });
-        uids = uids.filter(function (uid) { return !skipUidSet.has(uid); });
+        uids = uids.filter(function (uid) {
+          return !skipUidSet.has(uid);
+        });
       }
 
       // 3) Firestore batched updates
       let fsCount = 0;
       for (const group of chunk(empDocs, 450)) {
-        const batch = fsdb.batch();
+        const batch = db.batch();
         group.forEach(function (ds) {
           batch.set(
             ds.ref,
@@ -1160,7 +1346,7 @@ exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res)
               active: true,
               unlockedAt: FieldValue.serverTimestamp(),
               unlockedBy: "http",
-              unlockedNote: reason
+              unlockedNote: reason,
             },
             { merge: true }
           );
@@ -1177,18 +1363,36 @@ exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res)
             return admin
               .auth()
               .updateUser(uid, { disabled: false })
-              .then(function () { authCount++; })
+              .then(function () {
+                authCount++;
+              })
               .catch(function (e) {
-                console.error("Auth enable failed for", uid, e && e.message ? e.message : String(e));
+                console.error(
+                  "Auth enable failed for",
+                  uid,
+                  e && e.message ? e.message : String(e)
+                );
               });
           })
         );
-        await new Promise(function (r) { setTimeout(r, 150); });
+        await new Promise(function (r) {
+          setTimeout(r, 150);
+        });
       }
 
-      console.log("[enableHostelAndEmployees]",
-        "hostel:", hostelid, "docs:", empDocs.length, "uids:", uids.length,
-        "skippedSuperadmins:", skippedSuperadmins, "skippedByUid:", skippedByUid);
+      console.log(
+        "[enableHostelAndEmployees]",
+        "hostel:",
+        hostelid,
+        "docs:",
+        empDocs.length,
+        "uids:",
+        uids.length,
+        "skippedSuperadmins:",
+        skippedSuperadmins,
+        "skippedByUid:",
+        skippedByUid
+      );
 
       return res.status(200).json({
         success: true,
@@ -1196,18 +1400,23 @@ exports.enableHostelAndEmployees = functions.https.onRequest(function (req, res)
         firestoreUpdatedEmployees: fsCount,
         authEnabledUsers: authCount,
         skippedSuperadmins: skippedSuperadmins,
-        skippedByUid: skippedByUid
+        skippedByUid: skippedByUid,
       });
     } catch (err) {
-      console.error("enableHostelAndEmployees error:", err && err.message ? err.message : String(err));
-      return res.status(500).json({ error: err && err.message ? err.message : "Internal error" });
+      console.error(
+        "enableHostelAndEmployees error:",
+        err && err.message ? err.message : String(err)
+      );
+      return res.status(500).json({
+        error: err && err.message ? err.message : "Internal error",
+      });
     }
   });
 });
 
 // ========== Maintenance: status update ==========
 exports.sendMaintenanceStatusNotification = onDocumentUpdated(
-  "maintenance/{maintId}",
+  { document: "maintenance/{maintId}", database: "mymor-australia" },
   async (event) => {
     const before = event.data.before.data() || {};
     const after = event.data.after.data() || {};
@@ -1216,7 +1425,6 @@ exports.sendMaintenanceStatusNotification = onDocumentUpdated(
     const beforeStatus = (before.status || "").trim();
     const afterStatus = (after.status || "").trim();
 
-    // only act if status changed
     if (!afterStatus || beforeStatus === afterStatus) {
       console.log("No status change for maintenance", maintId);
       return null;
@@ -1229,27 +1437,7 @@ exports.sendMaintenanceStatusNotification = onDocumentUpdated(
       return null;
     }
 
-    // Tokens: look inside hostelTokens tree at specific uid
-    const snap = await db.ref(`/hostelTokens/${hostelid}/${requesterUid}`).once("value");
-    const val = snap.val();
-    if (!val) {
-      console.log("No tokens for user", requesterUid);
-      return null;
-    }
-
-    let tokens = [];
-    if (typeof val === "string") tokens = [val];
-    else if (Array.isArray(val)) tokens = val;
-    else if (typeof val === "object") {
-      if (val.token) tokens.push(val.token);
-      if (Array.isArray(val.tokens)) tokens.push(...val.tokens);
-      Object.values(val).forEach((maybe) => {
-        if (typeof maybe === "string") tokens.push(maybe);
-        if (Array.isArray(maybe)) tokens.push(...maybe);
-      });
-    }
-    tokens = Array.from(new Set(tokens.filter(Boolean)));
-
+    const tokens = await tokensForUser(hostelid, requesterUid);
     if (!tokens.length) {
       console.log("No FCM tokens found for requester", requesterUid);
       return null;
@@ -1288,29 +1476,9 @@ exports.sendMaintenanceStatusNotification = onDocumentUpdated(
   }
 );
 
-// ========= Helper: collect tokens for a specific user in a hostel =========
-async function tokensForUser(hostelid, uid) {
-  if (!hostelid || !uid) return [];
-  const snap = await db.ref(`/hostelTokens/${hostelid}/${uid}`).once("value");
-  const val = snap.val();
-  if (!val) return [];
-
-  let tokens = [];
-  if (typeof val === "string") tokens = [val];
-  else if (Array.isArray(val)) tokens = val;
-  else if (typeof val === "object") {
-    if (val.token) tokens.push(val.token);
-    if (Array.isArray(val.tokens)) tokens.push(...val.tokens);
-    Object.values(val).forEach((maybe) => {
-      if (typeof maybe === "string") tokens.push(maybe);
-      if (Array.isArray(maybe)) tokens.push(...maybe);
-    });
-  }
-  return Array.from(new Set(tokens.filter(Boolean)));
-}
 // ========== Report Incident: status update ==========
 exports.sendIncidentStatusNotification = onDocumentUpdated(
-  "reportincident/{incidentId}",
+  { document: "reportincident/{incidentId}", database: "mymor-australia" },
   async (event) => {
     const before = event.data.before.data() || {};
     const after = event.data.after.data() || {};
@@ -1336,7 +1504,8 @@ exports.sendIncidentStatusNotification = onDocumentUpdated(
       return null;
     }
 
-    const titleOrType = after.title || after.incidentType || after.category || "Incident";
+    const titleOrType =
+      after.title || after.incidentType || after.category || "Incident";
     const location = after.location || after.roomno || "";
 
     const payload = {
@@ -1355,7 +1524,9 @@ exports.sendIncidentStatusNotification = onDocumentUpdated(
 
     try {
       const resp = await admin.messaging().sendEachForMulticast({ tokens, ...payload });
-      console.log(`[sendIncidentStatusNotification] ${resp.successCount} sent for ${incidentId}`);
+      console.log(
+        `[sendIncidentStatusNotification] ${resp.successCount} sent for ${incidentId}`
+      );
       return resp;
     } catch (err) {
       console.error("[Incident] FCM error:", err);
@@ -1363,9 +1534,10 @@ exports.sendIncidentStatusNotification = onDocumentUpdated(
     }
   }
 );
+
 // ========== Feedback: status update ==========
 exports.sendFeedbackStatusNotification = onDocumentUpdated(
-  "feedback/{feedbackId}",
+  { document: "feedback/{feedbackId}", database: "mymor-australia" },
   async (event) => {
     const before = event.data.before.data() || {};
     const after = event.data.after.data() || {};
@@ -1391,7 +1563,8 @@ exports.sendFeedbackStatusNotification = onDocumentUpdated(
       return null;
     }
 
-    const subjectOrType = after.subject || after.title || after.category || "Feedback";
+    const subjectOrType =
+      after.subject || after.title || after.category || "Feedback";
 
     const payload = {
       notification: {
@@ -1409,7 +1582,9 @@ exports.sendFeedbackStatusNotification = onDocumentUpdated(
 
     try {
       const resp = await admin.messaging().sendEachForMulticast({ tokens, ...payload });
-      console.log(`[sendFeedbackStatusNotification] ${resp.successCount} sent for ${feedbackId}`);
+      console.log(
+        `[sendFeedbackStatusNotification] ${resp.successCount} sent for ${feedbackId}`
+      );
       return resp;
     } catch (err) {
       console.error("[Feedback] FCM error:", err);
@@ -1418,10 +1593,9 @@ exports.sendFeedbackStatusNotification = onDocumentUpdated(
   }
 );
 
-
 // ========== Booking: status update ==========
 exports.sendBookingStatusNotification = onDocumentUpdated(
-  "bookingroom/{bookingId}",
+  { document: "bookingroom/{bookingId}", database: "mymor-australia" },
   async (event) => {
     const before = event.data.before.data() || {};
     const after = event.data.after.data() || {};
@@ -1430,7 +1604,6 @@ exports.sendBookingStatusNotification = onDocumentUpdated(
     const prev = (before.status || "").trim();
     const next = (after.status || "").trim();
 
-    // Only notify on a change
     if (!next || prev === next) {
       console.log("[Booking] No status change for", bookingId);
       return null;
@@ -1452,12 +1625,13 @@ exports.sendBookingStatusNotification = onDocumentUpdated(
     const roomName = after.roomname || before.roomname || "Room";
     const datePretty = (() => {
       try {
-        const s = (after.startdate || before.startdate);
-        const e = (after.enddate || before.enddate);
-        const sd = s.toDate ? s.toDate() : s ? new Date(s) : null;
-        const ed = e.toDate ? e.toDate() : e ? new Date(e) : null;
+        const s = after.startdate || before.startdate;
+        const e = after.enddate || before.enddate;
+        const sd = s && s.toDate ? s.toDate() : s ? new Date(s) : null;
+        const ed = e && e.toDate ? e.toDate() : e ? new Date(e) : null;
         if (!sd) return "";
-        const fmt = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        const fmt = (d) =>
+          d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
         return ed
           ? ` ${sd.toDateString()} • ${fmt(sd)}–${fmt(ed)}`
           : ` ${sd.toDateString()}`;
@@ -1466,7 +1640,6 @@ exports.sendBookingStatusNotification = onDocumentUpdated(
       }
     })();
 
-    // Slightly different copy if specifically rejected
     const isRejected = next.toLowerCase() === "rejected";
     const title = isRejected ? "Booking Rejected" : "Booking Status Updated";
     const body = isRejected
@@ -1486,7 +1659,9 @@ exports.sendBookingStatusNotification = onDocumentUpdated(
 
     try {
       const resp = await admin.messaging().sendEachForMulticast({ tokens, ...payload });
-      console.log(`[sendBookingStatusNotification] ${resp.successCount} sent for ${bookingId} (${prev} → ${next})`);
+      console.log(
+        `[sendBookingStatusNotification] ${resp.successCount} sent for ${bookingId} (${prev} → ${next})`
+      );
       return resp;
     } catch (err) {
       console.error("[Booking] FCM error:", err);
@@ -1495,67 +1670,81 @@ exports.sendBookingStatusNotification = onDocumentUpdated(
   }
 );
 
-
 exports.setUsersDisabledBulk = functions.https.onCall(async (data, context) => {
-  // Optional: enforce admin
   const claims = (context.auth && context.auth.token) || {};
   if (!claims || claims.admin !== true) {
-    throw new functions.https.HttpsError("permission-denied", "Only admins can perform this action.");
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Only admins can perform this action."
+    );
   }
 
   const toDisable = Array.isArray(data.toDisable) ? data.toDisable : [];
   const toEnable = Array.isArray(data.toEnable) ? data.toEnable : [];
 
-  const fs = admin.firestore();
   const now = admin.firestore.FieldValue.serverTimestamp();
 
   // ---- 1) Auth updates (batched) ----
   for (const group of chunk(toDisable, 50)) {
     await Promise.all(
-      group.map(uid =>
-        admin.auth().updateUser(uid, { disabled: true }).catch(e => {
-          console.error("[Auth bulk disable] failed for", uid, e.message || String(e));
-          return null;
-        })
+      group.map((uid) =>
+        admin
+          .auth()
+          .updateUser(uid, { disabled: true })
+          .catch((e) => {
+            console.error("[Auth bulk disable] failed for", uid, e.message || String(e));
+            return null;
+          })
       )
     );
-    await new Promise(r => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 120));
   }
 
   for (const group of chunk(toEnable, 50)) {
     await Promise.all(
-      group.map(uid =>
-        admin.auth().updateUser(uid, { disabled: false }).catch(e => {
-          console.error("[Auth bulk enable] failed for", uid, e.message || String(e));
-          return null;
-        })
+      group.map((uid) =>
+        admin
+          .auth()
+          .updateUser(uid, { disabled: false })
+          .catch((e) => {
+            console.error("[Auth bulk enable] failed for", uid, e.message || String(e));
+            return null;
+          })
       )
     );
-    await new Promise(r => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 120));
   }
 
   // ---- 2) Firestore updates (batched) ----
   const writeBatches = [];
 
   const writeChunk = async (uids, status) => {
-    const b = fs.batch();
-    uids.forEach(uid => {
-      const ref = fs.collection("users").doc(uid); // doc.id == uid
+    const b = db.batch();
+    uids.forEach((uid) => {
+      const ref = db.collection("users").doc(uid);
       if (status === "disabled") {
-        b.set(ref, {
-          accountStatus: "disabled",
-          verified: false,
-          disabledReason: "Not present in verification upload",
-          disabledAt: now
-        }, { merge: true });
+        b.set(
+          ref,
+          {
+            accountStatus: "disabled",
+            verified: false,
+            disabledReason: "Not present in verification upload",
+            disabledAt: now,
+          },
+          { merge: true }
+        );
       } else {
-        b.set(ref, {
-          accountStatus: "active",
-          verified: true,
-          verifiedAt: now,
-          disabledReason: null,
-          disabledAt: null
-        }, { merge: true });
+        b.set(
+          ref,
+          {
+            accountStatus: "active",
+            verified: true,
+            verifiedAt: now,
+            disabledReason: null,
+            disabledAt: null,
+          },
+          { merge: true }
+        );
       }
     });
     writeBatches.push(b.commit());
@@ -1568,9 +1757,10 @@ exports.setUsersDisabledBulk = functions.https.onCall(async (data, context) => {
   return {
     success: true,
     disabledCount: toDisable.length,
-    enabledCount: toEnable.length
+    enabledCount: toEnable.length,
   };
 });
+
 exports.bulkSetUsersStatus = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
     try {
@@ -1582,58 +1772,77 @@ exports.bulkSetUsersStatus = functions.https.onRequest((req, res) => {
       const toDisable = Array.isArray(body.toDisable) ? body.toDisable : [];
       const toEnable = Array.isArray(body.toEnable) ? body.toEnable : [];
 
-      const fs = admin.firestore();
       const now = admin.firestore.FieldValue.serverTimestamp();
-
-      // (Optional) Add your own auth/secret check here if exposed publicly.
 
       // 1) Auth updates
       for (const group of chunk(toDisable, 50)) {
         await Promise.all(
-          group.map(uid =>
-            admin.auth().updateUser(uid, { disabled: true }).catch(e => {
-              console.error("[Auth bulk disable] failed for", uid, e.message || String(e));
-              return null;
-            })
+          group.map((uid) =>
+            admin
+              .auth()
+              .updateUser(uid, { disabled: true })
+              .catch((e) => {
+                console.error(
+                  "[Auth bulk disable] failed for",
+                  uid,
+                  e.message || String(e)
+                );
+                return null;
+              })
           )
         );
-        await new Promise(r => setTimeout(r, 120));
+        await new Promise((r) => setTimeout(r, 120));
       }
 
       for (const group of chunk(toEnable, 50)) {
         await Promise.all(
-          group.map(uid =>
-            admin.auth().updateUser(uid, { disabled: false }).catch(e => {
-              console.error("[Auth bulk enable] failed for", uid, e.message || String(e));
-              return null;
-            })
+          group.map((uid) =>
+            admin
+              .auth()
+              .updateUser(uid, { disabled: false })
+              .catch((e) => {
+                console.error(
+                  "[Auth bulk enable] failed for",
+                  uid,
+                  e.message || String(e)
+                );
+                return null;
+              })
           )
         );
-        await new Promise(r => setTimeout(r, 120));
+        await new Promise((r) => setTimeout(r, 120));
       }
 
       // 2) Firestore updates
       const writeBatches = [];
 
       const writeChunk = async (uids, status) => {
-        const b = fs.batch();
-        uids.forEach(uid => {
-          const ref = fs.collection("users").doc(uid); // doc.id == uid
+        const b = db.batch();
+        uids.forEach((uid) => {
+          const ref = db.collection("users").doc(uid);
           if (status === "disabled") {
-            b.set(ref, {
-              accountStatus: "disabled",
-              verified: false,
-              disabledReason: "Not present in verification upload",
-              disabledAt: now
-            }, { merge: true });
+            b.set(
+              ref,
+              {
+                accountStatus: "disabled",
+                verified: false,
+                disabledReason: "Not present in verification upload",
+                disabledAt: now,
+              },
+              { merge: true }
+            );
           } else {
-            b.set(ref, {
-              accountStatus: "active",
-              verified: true,
-              verifiedAt: now,
-              disabledReason: null,
-              disabledAt: null
-            }, { merge: true });
+            b.set(
+              ref,
+              {
+                accountStatus: "active",
+                verified: true,
+                verifiedAt: now,
+                disabledReason: null,
+                disabledAt: null,
+              },
+              { merge: true }
+            );
           }
         });
         writeBatches.push(b.commit());
@@ -1646,7 +1855,7 @@ exports.bulkSetUsersStatus = functions.https.onRequest((req, res) => {
       return res.status(200).json({
         success: true,
         disabledCount: toDisable.length,
-        enabledCount: toEnable.length
+        enabledCount: toEnable.length,
       });
     } catch (err) {
       console.error("bulkSetUsersStatus error:", err.message || String(err));
@@ -1656,23 +1865,25 @@ exports.bulkSetUsersStatus = functions.https.onRequest((req, res) => {
 });
 
 // ========== Groups: join request (notify creator for Private/Hidden) ==========
-exports.notifyJoinRequest = onValueCreated(
-  "/groups/{groupId}/joinRequests/{requesterUid}",
+exports.notifyJoinRequest = onDocumentCreated(
+  {
+    document: "groups/{groupId}/joinRequests/{requesterUid}",
+    database: "mymor-australia",
+  },
   async (event) => {
     try {
       const { groupId, requesterUid } = event.params;
-      const joinReq = event.data.val() || {};
+      const joinReq = event.data.data() || {};
 
-      // Only when request is created (or is pending)
       const status = (joinReq.status || "pending").toLowerCase();
       if (status !== "pending") {
         console.log("[notifyJoinRequest] status not pending, skip:", status);
         return null;
       }
 
-      // Load group → need creatorId, groupType, title, hostelid
-      const gSnap = await db.ref(`/groups/${groupId}`).once("value");
-      const group = gSnap.val() || {};
+      // Load group from Firestore
+      const gSnap = await db.collection("groups").doc(groupId).get();
+      const group = gSnap.data() || {};
       const creatorId = group.creatorId;
       const privacy = group.groupType || "Private";
       const hostelid = group.hostelid || "";
@@ -1686,10 +1897,14 @@ exports.notifyJoinRequest = onValueCreated(
         return null;
       }
 
-      // 1) Write an in-app notification for creator
-      const notifRef = db.ref(`/notifications/${creatorId}`).push();
+      // 1) Write an in-app notification for creator (Firestore)
+      const notifRef = db
+        .collection("users")
+        .doc(creatorId)
+        .collection("notifications")
+        .doc();
       const payload = {
-        id: notifRef.key,
+        id: notifRef.id,
         type: "group:join_request",
         groupId,
         groupTitle: group.title || "",
@@ -1697,18 +1912,22 @@ exports.notifyJoinRequest = onValueCreated(
         fromUid: requesterUid,
         fromName: joinReq.name || "",
         fromPhoto: joinReq.photoURL || "",
-        createdAt: Date.now(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
         read: false,
       };
       await notifRef.set(payload);
 
-      // (Optional) also create an inbox thread if you use it in UI
+      // Also write to inbox
       await db
-        .ref(`/userInboxes/${creatorId}/groupJoinRequests/${groupId}/${requesterUid}`)
-        .set({ ...payload, requestedAt: Date.now() });
+        .collection("userInboxes")
+        .doc(creatorId)
+        .collection("groupJoinRequests")
+        .doc(groupId)
+        .collection("requests")
+        .doc(requesterUid)
+        .set({ ...payload, requestedAt: admin.firestore.FieldValue.serverTimestamp() });
 
-      // 2) Send FCM push to the creator (scoped by hostel)
-      // Reuses your hostel-based token tree + helper
+      // 2) Send FCM push to the creator
       const tokens = await tokensForUser(hostelid, creatorId);
       if (!tokens.length) {
         console.log("[notifyJoinRequest] no creator tokens found");
@@ -1718,69 +1937,86 @@ exports.notifyJoinRequest = onValueCreated(
       const message = {
         notification: {
           title: "New join request",
-          body: `${payload.fromName || "Someone"} requested to join "${payload.groupTitle || "your group"}"`,
+          body: `${joinReq.name || "Someone"} requested to join "${group.title || "your group"}"`,
         },
         data: {
           type: "group:join_request",
-          screen: "AcademicGroup",       // customize for your nav
+          screen: "AcademicGroup",
           groupId,
           hostelid: hostelid || "",
         },
       };
 
-      // Chunked send (keeps consistency with your other senders)
       const chunkSize = 500;
       for (let i = 0; i < tokens.length; i += chunkSize) {
-        const batch = tokens.slice(i, i + chunkSize);
-        await admin.messaging().sendEachForMulticast({ tokens: batch, ...message });
+        await admin
+          .messaging()
+          .sendEachForMulticast({ tokens: tokens.slice(i, i + chunkSize), ...message });
       }
       console.log("[notifyJoinRequest] push sent to creator:", creatorId);
 
       return null;
     } catch (err) {
-      console.error("[notifyJoinRequest] error:", err && err.message ? err.message : String(err));
+      console.error(
+        "[notifyJoinRequest] error:",
+        err && err.message ? err.message : String(err)
+      );
       return null;
     }
   }
 );
 
 // ========== Groups: join approved (notify requester) ==========
-exports.notifyJoinApproved = onValueCreated(
-  "/groups/{groupId}/joinRequests/{requesterUid}/status",
+// Uses onDocumentUpdated — watches the joinRequest doc for status changing to "approved"
+exports.notifyJoinApproved = onDocumentUpdated(
+  {
+    document: "groups/{groupId}/joinRequests/{requesterUid}",
+    database: "mymor-australia",
+  },
   async (event) => {
     const { groupId, requesterUid } = event.params;
-    const status = (event.data.val() || '').toLowerCase();
-    if (status !== 'approved') return null;
+    const before = event.data.before.data() || {};
+    const after = event.data.after.data() || {};
 
-    // group load
-    const gSnap = await getDatabase().ref(`/groups/${groupId}`).once('value');
-    const group = gSnap.val() || {};
-    const hostelid = group.hostelid || '';
-    const title = group.title || 'Group';
+    const prevStatus = (before.status || "").toLowerCase().trim();
+    const newStatus = (after.status || "").toLowerCase().trim();
 
-    // requester ke tokens (aapke helpers ke saath)
+    // Only fire when status changes to "approved"
+    if (prevStatus === newStatus || newStatus !== "approved") return null;
+
+    // Load group
+    const gSnap = await db.collection("groups").doc(groupId).get();
+    const group = gSnap.data() || {};
+    const hostelid = group.hostelid || "";
+    const title = group.title || "Group";
+
+    // Requester tokens
     const tokens = await tokensForUser(hostelid, requesterUid);
     if (!tokens.length) return null;
 
-    // in-app notification bhi likh do (server-authoritative)
-    const notifRef = getDatabase().ref(`/notifications/${requesterUid}`).push();
+    // Write in-app notification to Firestore
+    const notifRef = db
+      .collection("users")
+      .doc(requesterUid)
+      .collection("notifications")
+      .doc();
     await notifRef.set({
-      id: notifRef.key,
-      type: 'group:join_approved',
+      id: notifRef.id,
+      type: "group:join_approved",
       groupId,
       groupTitle: title,
-      createdAt: Date.now(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
       read: false,
     });
 
     const message = {
       notification: {
-        title: 'Request approved',
+        title: "Request approved",
         body: `You can now chat in "${title}"`,
       },
       data: {
-        type: 'group:join_approved',
-        screen: 'GroupChat',
+        type: "group:join_approved",
+        screen: "GroupChat",
         groupId,
         groupTitle: title,
       },
@@ -1788,8 +2024,9 @@ exports.notifyJoinApproved = onValueCreated(
 
     const chunkSize = 500;
     for (let i = 0; i < tokens.length; i += chunkSize) {
-      const batch = tokens.slice(i, i + chunkSize);
-      await admin.messaging().sendEachForMulticast({ tokens: batch, ...message });
+      await admin
+        .messaging()
+        .sendEachForMulticast({ tokens: tokens.slice(i, i + chunkSize), ...message });
     }
     return null;
   }
@@ -1811,7 +2048,7 @@ exports.createInvite = functions.https.onRequest((req, res) => {
       const token = require("crypto").randomBytes(12).toString("hex");
       const expiresAt = Date.now() + ttlHours * 60 * 60 * 1000;
 
-      await admin.firestore().collection("invites").doc(token).set({
+      await db.collection("invites").doc(token).set({
         gid,
         createdBy: uid,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1821,7 +2058,6 @@ exports.createInvite = functions.https.onRequest((req, res) => {
         active: true,
       });
 
-      // IMPORTANT: include g + t so your RN parse matches
       const shareUrl = `https://links.mymor.app/invite?g=${gid}&t=${token}`;
 
       console.log(`[createInvite] ✅ Created invite for group ${gid}: ${shareUrl}`);
@@ -1839,6 +2075,7 @@ exports.createInvite = functions.https.onRequest((req, res) => {
     }
   });
 });
+
 exports.acceptInvite = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
     try {
@@ -1851,7 +2088,7 @@ exports.acceptInvite = functions.https.onRequest((req, res) => {
         return res.status(400).json({ error: "Missing uid, gid, or tokenId" });
       }
 
-      const inviteRef = fsdb.collection("invites").doc(tokenId);
+      const inviteRef = db.collection("invites").doc(tokenId);
       const snap = await inviteRef.get();
 
       if (!snap.exists) {
@@ -1861,22 +2098,27 @@ exports.acceptInvite = functions.https.onRequest((req, res) => {
       const invite = snap.data() || {};
       const now = Date.now();
 
-      if (!invite.active) return res.status(400).json({ error: "Invite is inactive" });
+      if (!invite.active)
+        return res.status(400).json({ error: "Invite is inactive" });
       if (invite.expiresAt && invite.expiresAt < now)
         return res.status(400).json({ error: "Invite expired" });
-      if (invite.gid !== gid) return res.status(400).json({ error: "Invite does not match this group" });
+      if (invite.gid !== gid)
+        return res.status(400).json({ error: "Invite does not match this group" });
       if (invite.maxUses && invite.uses >= invite.maxUses)
         return res.status(400).json({ error: "Invite max uses reached" });
 
-      const memberPath = `/discovergroup/${gid}/members/${uid}`;
-
-      // optional: avoid duplicate
-      const existing = await db.ref(memberPath).once("value");
-      if (!existing.exists()) {
-        await db.ref(memberPath).set({
+      // Write member to Firestore (discovergroup/{gid}/members/{uid})
+      const memberRef = db
+        .collection("discovergroup")
+        .doc(gid)
+        .collection("members")
+        .doc(uid);
+      const existing = await memberRef.get();
+      if (!existing.exists) {
+        await memberRef.set({
           uid,
           isAdmin: false,
-          joinedAt: Date.now(),
+          joinedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
       }
 
@@ -1897,113 +2139,20 @@ exports.acceptInvite = functions.https.onRequest((req, res) => {
   });
 });
 
+// ========== Notification Settings helpers ==========
+// (isNotificationsEnabledFor defined above near getUserNotificationSettings)
 
-async function tokensForUserId(uid) {
-  if (!uid) return [];
-  // Apna actual token-path yaha daalna
-  const snap = await db.ref(`/userTokens/${uid}`).once("value");
-  const val = snap.val();
-  if (!val) return [];
-
-  let tokens = [];
-  if (typeof val === "string") tokens = [val];
-  else if (Array.isArray(val)) tokens = val;
-  else if (typeof val === "object") {
-    if (val.token) tokens.push(val.token);
-    if (Array.isArray(val.tokens)) tokens.push(...val.tokens);
-    Object.values(val).forEach((maybe) => {
-      if (typeof maybe === "string") tokens.push(maybe);
-      if (Array.isArray(maybe)) tokens.push(...maybe);
-    });
-  }
-  return Array.from(new Set(tokens.filter(Boolean)));
-}
-
-// ========= Notification Settings helpers =========
-async function getUserNotificationSettings(uid) {
-  const snap = await db.ref(`/notificationSettings/${uid}`).once("value");
-  const val = snap.val() || {};
-
-  const globalEnabled =
-    !val.global || val.global.enabled !== false; // default: true
-
-  const channels = val.channels || {};
-  const mutedGroups = val.mutedGroups || {};
-
-  return { globalEnabled, channels, mutedGroups };
-}
-
-async function isNotificationsEnabledFor(uid, opts) {
-  const { channel, groupId, communityId, discoverGroupId } = opts || {};
-  const s = await getUserNotificationSettings(uid);
-
-  // 1) Global switch
-  if (!s.globalEnabled) return false;
-
-  // 2) Channel switch (agar explicitly false hai to band)
-  if (
-    channel &&
-    Object.prototype.hasOwnProperty.call(s.channels, channel) &&
-    s.channels[channel] === false
-  ) {
-    return false;
-  }
-
-  // 3) Per-group mute
-  const mg = s.mutedGroups || {};
-
-  if (channel === "chat" && groupId) {
-    if (mg.chat && mg.chat[groupId] && mg.chat[groupId].muted) return false;
-  }
-
-  if (channel === "community" && communityId) {
-    if (mg.community && mg.community[communityId] && mg.community[communityId].muted)
-      return false;
-  }
-
-  if (channel === "discoverAnnouncements" && discoverGroupId) {
-    if (mg.discover && mg.discover[discoverGroupId] && mg.discover[discoverGroupId].muted)
-      return false;
-  }
-
-  return true;
-}
-async function tokensForDiscoverGroupMembersWithSettings(groupId, senderUid) {
-  if (!groupId) return [];
-
-  const snap = await db.ref(`/discovergroup/${groupId}/members`).once("value");
-  const members = snap.val() || {};
-  if (!members || typeof members !== "object") return [];
-
-  const memberUids = Object.keys(members).filter(
-    (uid) => uid && uid !== String(senderUid)
-  );
-  if (!memberUids.length) return [];
-
-  const tokenSets = await Promise.all(
-    memberUids.map(async (uid) => {
-      const enabled = await isNotificationsEnabledFor(uid, {
-        channel: "discoverAnnouncements",
-        discoverGroupId: groupId,
-      });
-      if (!enabled) return [];
-      return tokensForUserId(uid);
-    })
-  );
-
-  const all = tokenSets.flat().filter(Boolean);
-  return Array.from(new Set(all));
-}
 // ========== Discover: NEW ANNOUNCEMENT ==========
-exports.sendDiscoverAnnouncementNotificationV2 = onValueCreated(
-  "/discoverannouncements/{announcementId}",
+exports.sendDiscoverAnnouncementNotificationV2 = onDocumentCreated(
+  { document: "discoverannouncements/{announcementId}", database: "mymor-australia" },
   async (event) => {
     const { announcementId } = event.params;
-    const data = event.data.val() || {};
+    const data = event.data.data() || {};
 
     const groupId = data.groupid;
-    const senderUid = data.createdBy.uid || data.uid || "";
-    const senderName = data.createdBy.displayName || data.user || "Someone";
+    const createdBy = data.createdBy || {};
+    const senderUid = createdBy.uid || data.uid || "";
+    const senderName = createdBy.displayName || data.user || "Someone";
     const title = data.title || "New announcement";
     const shortdesc = data.shortdesc || "";
     const bodyText = shortdesc || title;
@@ -2018,7 +2167,9 @@ exports.sendDiscoverAnnouncementNotificationV2 = onValueCreated(
       senderUid
     );
     if (!tokens.length) {
-      console.log("[sendDiscoverAnnouncementNotificationV2] No tokens (maybe muted/off)");
+      console.log(
+        "[sendDiscoverAnnouncementNotificationV2] No tokens (maybe muted/off)"
+      );
       return null;
     }
 
@@ -2038,9 +2189,8 @@ exports.sendDiscoverAnnouncementNotificationV2 = onValueCreated(
 
     const chunkSize = 500;
     for (let i = 0; i < tokens.length; i += chunkSize) {
-      const batch = tokens.slice(i, i + chunkSize);
       await admin.messaging().sendEachForMulticast({
-        tokens: batch,
+        tokens: tokens.slice(i, i + chunkSize),
         ...payload,
       });
     }
@@ -2051,43 +2201,16 @@ exports.sendDiscoverAnnouncementNotificationV2 = onValueCreated(
     return null;
   }
 );
-// ========== Discover Group CHAT: members + notification settings ==========
-async function tokensForDiscoverGroupChatMembers(groupId, senderUid) {
-  if (!groupId) return [];
 
-  // Members of discover group
-  const snap = await db.ref(`/discovergroup/${groupId}/members`).once("value");
-  const members = snap.val() || {};
-  if (!members || typeof members !== "object") return [];
-
-  // Sab members, lekin sender ko chhod ke
-  const memberUids = Object.keys(members).filter(
-    (uid) => uid && uid !== String(senderUid)
-  );
-  if (!memberUids.length) return [];
-
-  // Per-user notification settings + tokens
-  const tokenSets = await Promise.all(
-    memberUids.map(async (uid) => {
-      // Channel: "chat" + groupId for per-group mute
-      const enabled = await isNotificationsEnabledFor(uid, {
-        channel: "chat",
-        groupId,
-      });
-      if (!enabled) return [];
-      return tokensForUserId(uid);
-    })
-  );
-
-  const all = tokenSets.flat().filter(Boolean);
-  return Array.from(new Set(all)); // dedupe
-}
-// ========== Discover Group CHAT: message notification (V2) ==========
-exports.sendDiscoverGroupMessageNotificationV2 = onValueCreated(
-  "/discovergroupmessages/{groupId}/{messageId}",
+// ========== Discover Group CHAT: message notification ==========
+exports.sendDiscoverGroupMessageNotificationV2 = onDocumentCreated(
+  {
+    document: "discovergroup/{groupId}/messages/{messageId}",
+    database: "mymor-australia",
+  },
   async (event) => {
     const { groupId, messageId } = event.params;
-    const msg = event.data.val() || {};
+    const msg = event.data.data() || {};
 
     const senderId = msg.senderId || msg.uid || "";
     const senderName = msg.sender || msg.user || "Someone";
@@ -2095,43 +2218,46 @@ exports.sendDiscoverGroupMessageNotificationV2 = onValueCreated(
     const type = msg.type || "";
     const posterUrl = msg.posterUrl || msg.imageUrl || "";
 
-    // group name agar message me nahi hai to discovergroup node se le aao
+    // group name: prefer message field, fallback to discovergroup doc
     let groupName = msg.groupName || "";
     if (!groupName) {
       try {
-        const gSnap = await db.ref(`/discovergroup/${groupId}`).once("value");
-        const gVal = gSnap.val() || {};
+        const gSnap = await db.collection("discovergroup").doc(groupId).get();
+        const gVal = gSnap.data() || {};
         groupName = gVal.title || gVal.name || "";
       } catch (e) {
-        console.log("[sendDiscoverGroupMessageNotificationV2] group load error:", e.message || String(e));
+        console.log(
+          "[sendDiscoverGroupMessageNotificationV2] group load error:",
+          e.message || String(e)
+        );
       }
     }
 
-    // Agar sender hi nahi mila ya groupId missing, to skip
     if (!groupId || !senderId) {
-      console.log("[sendDiscoverGroupMessageNotificationV2] missing groupId/senderId, skip");
+      console.log(
+        "[sendDiscoverGroupMessageNotificationV2] missing groupId/senderId, skip"
+      );
       return null;
     }
 
-    // Sirf discover group ke members (sender ko chhod ke), settings + mute ke respect me
     const tokens = await tokensForDiscoverGroupChatMembers(groupId, senderId);
     if (!tokens.length) {
-      console.log("[sendDiscoverGroupMessageNotificationV2] No tokens (maybe muted/off for all)");
+      console.log(
+        "[sendDiscoverGroupMessageNotificationV2] No tokens (maybe muted/off for all)"
+      );
       return null;
     }
 
-    // Body text – type ke hisaab se
     const body =
       !type || type === "text"
         ? `${senderName}: ${messageText || "Sent a message"}`
         : `${senderName} ${{
-          image: "sent an image",
-          audio: "sent a voice message",
-          video: "sent a video",
-          event: "created an event",
-          poll: "created a poll",
-        }[type] || "sent a message"
-        }`;
+            image: "sent an image",
+            audio: "sent a voice message",
+            video: "sent a video",
+            event: "created an event",
+            poll: "created a poll",
+          }[type] || "sent a message"}`;
 
     const payload = {
       notification: {
@@ -2139,7 +2265,7 @@ exports.sendDiscoverGroupMessageNotificationV2 = onValueCreated(
         body,
       },
       data: {
-        screen: "DiscoverGroupChat",   // apne app ke hisaab se adjust kar lo
+        screen: "DiscoverGroupChat",
         type: "discover_group_message",
         groupId,
         groupName: groupName || "",
@@ -2152,15 +2278,13 @@ exports.sendDiscoverGroupMessageNotificationV2 = onValueCreated(
       },
     };
 
-    // Chunked send
     const chunkSize = 500;
     let success = 0;
     let failure = 0;
 
     for (let i = 0; i < tokens.length; i += chunkSize) {
-      const batch = tokens.slice(i, i + chunkSize);
       const resp = await admin.messaging().sendEachForMulticast({
-        tokens: batch,
+        tokens: tokens.slice(i, i + chunkSize),
         ...payload,
       });
       success += resp.successCount;
@@ -2173,14 +2297,13 @@ exports.sendDiscoverGroupMessageNotificationV2 = onValueCreated(
     return null;
   }
 );
+
 // ========== Update user email by UID ==========
 exports.updateUserEmailByUid = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
     try {
       if (req.method !== "POST") {
-        return res
-          .status(405)
-          .json({ error: "Method Not Allowed. Use POST." });
+        return res.status(405).json({ error: "Method Not Allowed. Use POST." });
       }
 
       const { uid, newEmail } = req.body || {};
@@ -2199,14 +2322,9 @@ exports.updateUserEmailByUid = functions.https.onRequest((req, res) => {
 
       const trimmedEmail = newEmail.trim().toLowerCase();
 
-      // Get old user to return oldEmail in response (optional but useful)
       const userRecord = await admin.auth().getUser(uid);
-
-      // Update auth email
       const updatedUser = await admin.auth().updateUser(uid, {
         email: trimmedEmail,
-        // optional: force re-verification if you use it
-        // emailVerified: false,
       });
 
       return res.status(200).json({
@@ -2221,8 +2339,6 @@ exports.updateUserEmailByUid = functions.https.onRequest((req, res) => {
       if (err.code === "auth/user-not-found") {
         return res.status(404).json({ error: "User not found" });
       }
-
-      // Handle typical email conflicts
       if (err.code === "auth/email-already-exists") {
         return res
           .status(400)
@@ -2233,44 +2349,61 @@ exports.updateUserEmailByUid = functions.https.onRequest((req, res) => {
     }
   });
 });
-// ========== UNICLUB: Join Approved / Rejected (notify requester) ==========
-exports.notifyUniclubJoinDecision = onValueCreated(
-  "/uniclubs/{clubId}/joinRequests/{requesterUid}/status",
+
+// ========== UNICLUB: Join Approved / Rejected ==========
+// Uses onDocumentUpdated — watches joinRequest doc for status changing to approved/rejected
+exports.notifyUniclubJoinDecision = onDocumentUpdated(
+  {
+    document: "uniclubs/{clubId}/joinRequests/{requesterUid}",
+    database: "mymor-australia",
+  },
   async (event) => {
     try {
       const { clubId, requesterUid } = event.params;
-      const statusRaw = event.data.val();
-      const status = String(statusRaw || "").toLowerCase().trim();
+      const before = event.data.before.data() || {};
+      const after = event.data.after.data() || {};
 
-      if (status !== "approved" && status !== "rejected") {
-        console.log("[notifyUniclubJoinDecision] status not approved/rejected:", status);
+      const prevStatus = (before.status || "").toLowerCase().trim();
+      const newStatus = (after.status || "").toLowerCase().trim();
+
+      // Only fire when status changes to approved or rejected
+      if (
+        prevStatus === newStatus ||
+        (newStatus !== "approved" && newStatus !== "rejected")
+      ) {
+        console.log("[notifyUniclubJoinDecision] no qualifying status change:", newStatus);
         return null;
       }
 
-      // 1) Load club info (title + optional hostelid)
-      const cSnap = await db.ref(`/uniclubs/${clubId}`).once("value");
-      const club = cSnap.val() || {};
+      // 1) Load club info
+      const cSnap = await db.collection("uniclubs").doc(clubId).get();
+      const club = cSnap.data() || {};
       const clubTitle = club.title || club.name || "Club";
       const hostelid = club.hostelid || "";
 
-      // 2) Tokens of requester (FCM)
+      // 2) Tokens for requester
       const tokens = await tokensForUserId(requesterUid);
-      // agar aap hostel-wise token use karna chahte ho, replace with tokensForUser(hostelid, requesterUid)
 
-      // 3) Save in-app notification (RTDB)
-      const notifRef = db.ref(`/notifications/${requesterUid}`).push();
-      const notifPayload = {
-        id: notifRef.key,
-        type: status === "approved" ? "uniclub:join_approved" : "uniclub:join_rejected",
+      // 3) Write in-app notification to Firestore
+      const notifRef = db
+        .collection("users")
+        .doc(requesterUid)
+        .collection("notifications")
+        .doc();
+      await notifRef.set({
+        id: notifRef.id,
+        type:
+          newStatus === "approved"
+            ? "uniclub:join_approved"
+            : "uniclub:join_rejected",
         clubId,
         clubTitle,
-        status,
-        createdAt: Date.now(),
+        status: newStatus,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
         read: false,
-      };
-      await notifRef.set(notifPayload);
+      });
 
-      // 4) Send push notification (if tokens exist)
+      // 4) Send push notification
       if (!tokens.length) {
         console.log("[notifyUniclubJoinDecision] no tokens for requester:", requesterUid);
         return null;
@@ -2278,37 +2411,46 @@ exports.notifyUniclubJoinDecision = onValueCreated(
 
       const message = {
         notification: {
-          title: status === "approved" ? "Request approved ✅" : "Request rejected ❌",
+          title: newStatus === "approved" ? "Request approved ✅" : "Request rejected ❌",
           body:
-            status === "approved"
+            newStatus === "approved"
               ? `You are now a member of "${clubTitle}".`
               : `Your request to join "${clubTitle}" was rejected.`,
         },
         data: {
-          type: status === "approved" ? "uniclub:join_approved" : "uniclub:join_rejected",
-          screen: "UniclubDetail", // aapke app screen name ke hisaab se change kar lo
+          type:
+            newStatus === "approved"
+              ? "uniclub:join_approved"
+              : "uniclub:join_rejected",
+          screen: "UniclubDetail",
           clubId,
           clubTitle,
-          status,
+          status: newStatus,
           hostelid: String(hostelid || ""),
         },
       };
 
-      // chunk send
       const chunkSize = 500;
       for (let i = 0; i < tokens.length; i += chunkSize) {
-        const batch = tokens.slice(i, i + chunkSize);
-        await admin.messaging().sendEachForMulticast({ tokens: batch, ...message });
+        await admin
+          .messaging()
+          .sendEachForMulticast({ tokens: tokens.slice(i, i + chunkSize), ...message });
       }
 
-      console.log(`[notifyUniclubJoinDecision] sent: club=${clubId} user=${requesterUid} status=${status}`);
+      console.log(
+        `[notifyUniclubJoinDecision] sent: club=${clubId} user=${requesterUid} status=${newStatus}`
+      );
       return null;
     } catch (err) {
-      console.error("[notifyUniclubJoinDecision] error:", err.message || String(err));
+      console.error(
+        "[notifyUniclubJoinDecision] error:",
+        err.message || String(err)
+      );
       return null;
     }
   }
 );
+
 // ========== Password Reset: Send OTP ==========
 exports.sendPasswordResetOtp = onRequest(
   {
@@ -2328,8 +2470,6 @@ exports.sendPasswordResetOtp = onRequest(
           return res.status(400).json({ error: { message: "Invalid email address" } });
         }
 
-        // Verify the user exists in Firebase Auth before sending a code
-        // (return generic success to avoid user-enumeration)
         try {
           await admin.auth().getUserByEmail(email);
         } catch (e) {
@@ -2345,7 +2485,7 @@ exports.sendPasswordResetOtp = onRequest(
         const codeHash = otpHash(email, code, otpSecret);
         const expiresAt = Date.now() + 20 * 60 * 1000; // 20 minutes
 
-        await fsdb.collection("passwordResetOtps").doc(requestId).set({
+        await db.collection("passwordResetOtps").doc(requestId).set({
           email,
           codeHash,
           expiresAt,
@@ -2377,13 +2517,15 @@ exports.sendPasswordResetOtp = onRequest(
         return res.status(200).json({ success: true, requestId });
       } catch (err) {
         console.error("[sendPasswordResetOtp] error:", err);
-        return res.status(500).json({ error: { message: err.message || "Failed to send reset code" } });
+        return res
+          .status(500)
+          .json({ error: { message: err.message || "Failed to send reset code" } });
       }
     });
   }
 );
 
-// ========== Password Reset: Verify OTP (step 2 — confirm code is correct) ==========
+// ========== Password Reset: Verify OTP (step 2) ==========
 exports.verifyPasswordResetOtp = onRequest(
   { region: "us-central1", secrets: [OTP_SECRET] },
   (req, res) => {
@@ -2405,7 +2547,7 @@ exports.verifyPasswordResetOtp = onRequest(
         const otpSecret = OTP_SECRET.value();
         if (!otpSecret) throw new Error("OTP_SECRET not configured");
 
-        const ref = fsdb.collection("passwordResetOtps").doc(requestId);
+        const ref = db.collection("passwordResetOtps").doc(requestId);
         const snap = await ref.get();
 
         if (!snap.exists) {
@@ -2414,36 +2556,43 @@ exports.verifyPasswordResetOtp = onRequest(
 
         const data = snap.data() || {};
 
-        if (data.used) return res.status(400).json({ error: { message: "Code already used" } });
-        if (data.email !== email) return res.status(400).json({ error: { message: "Email mismatch" } });
+        if (data.used)
+          return res.status(400).json({ error: { message: "Code already used" } });
+        if (data.email !== email)
+          return res.status(400).json({ error: { message: "Email mismatch" } });
         if (Date.now() > Number(data.expiresAt || 0)) {
           return res.status(400).json({ error: { message: "Code expired" } });
         }
 
         const attempts = Number(data.attempts || 0);
         if (attempts >= 5) {
-          return res.status(429).json({ error: { message: "Too many attempts. Request a new code." } });
+          return res
+            .status(429)
+            .json({ error: { message: "Too many attempts. Request a new code." } });
         }
 
         const ok = otpHash(email, code, otpSecret) === data.codeHash;
         if (!ok) {
           await ref.update({ attempts: admin.firestore.FieldValue.increment(1) });
-          return res.status(400).json({ error: { message: "Incorrect code. Please try again." } });
+          return res
+            .status(400)
+            .json({ error: { message: "Incorrect code. Please try again." } });
         }
 
-        // Mark as verified — the actual password update happens in step 3
         await ref.update({ verified: true });
 
         return res.status(200).json({ success: true });
       } catch (err) {
         console.error("[verifyPasswordResetOtp] error:", err);
-        return res.status(500).json({ error: { message: err.message || "Verification failed" } });
+        return res
+          .status(500)
+          .json({ error: { message: err.message || "Verification failed" } });
       }
     });
   }
 );
 
-// ========== Password Reset: Set new password (step 3 — update via Admin SDK) ==========
+// ========== Password Reset: Set new password (step 3) ==========
 exports.verifyOtpAndResetPassword = onRequest(
   { region: "us-central1", secrets: [OTP_SECRET] },
   (req, res) => {
@@ -2463,13 +2612,15 @@ exports.verifyOtpAndResetPassword = onRequest(
           return res.status(400).json({ error: { message: "Invalid payload" } });
         }
         if (!newPassword || newPassword.length < 8) {
-          return res.status(400).json({ error: { message: "Password must be at least 8 characters" } });
+          return res
+            .status(400)
+            .json({ error: { message: "Password must be at least 8 characters" } });
         }
 
         const otpSecret = OTP_SECRET.value();
         if (!otpSecret) throw new Error("OTP_SECRET not configured");
 
-        const ref = fsdb.collection("passwordResetOtps").doc(requestId);
+        const ref = db.collection("passwordResetOtps").doc(requestId);
         const snap = await ref.get();
 
         if (!snap.exists) {
@@ -2479,21 +2630,26 @@ exports.verifyOtpAndResetPassword = onRequest(
         const data = snap.data() || {};
 
         if (data.used) {
-          return res.status(400).json({ error: { message: "This reset code has already been used" } });
+          return res
+            .status(400)
+            .json({ error: { message: "This reset code has already been used" } });
         }
         if (data.email !== email) {
           return res.status(400).json({ error: { message: "Email mismatch" } });
         }
         if (Date.now() > Number(data.expiresAt || 0)) {
-          return res.status(400).json({ error: { message: "Code expired. Please request a new one." } });
+          return res
+            .status(400)
+            .json({ error: { message: "Code expired. Please request a new one." } });
         }
 
-        // Accept if already verified in step 2, otherwise re-verify the code
         const alreadyVerified = data.verified === true;
         if (!alreadyVerified) {
           const attempts = Number(data.attempts || 0);
           if (attempts >= 5) {
-            return res.status(429).json({ error: { message: "Too many attempts. Request a new code." } });
+            return res
+              .status(429)
+              .json({ error: { message: "Too many attempts. Request a new code." } });
           }
           const ok = otpHash(email, code, otpSecret) === data.codeHash;
           if (!ok) {
@@ -2502,37 +2658,42 @@ exports.verifyOtpAndResetPassword = onRequest(
           }
         }
 
-        // Look up the Firebase Auth user and update their password via Admin SDK
         let userRecord;
         try {
           userRecord = await admin.auth().getUserByEmail(email);
         } catch (e) {
-          return res.status(404).json({ error: { message: "No account found with this email" } });
+          return res
+            .status(404)
+            .json({ error: { message: "No account found with this email" } });
         }
 
         await admin.auth().updateUser(userRecord.uid, { password: newPassword });
 
-        // Mark OTP as used so it cannot be replayed
         await ref.update({
           used: true,
           usedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        console.log("[verifyOtpAndResetPassword] password reset for uid:", userRecord.uid);
+        console.log(
+          "[verifyOtpAndResetPassword] password reset for uid:",
+          userRecord.uid
+        );
         return res.status(200).json({ success: true });
       } catch (err) {
         console.error("[verifyOtpAndResetPassword] error:", err);
-        return res.status(500).json({ error: { message: err.message || "Password reset failed" } });
+        return res
+          .status(500)
+          .json({ error: { message: err.message || "Password reset failed" } });
       }
     });
   }
 );
 
-// ✅ Mentions notification (RTDB v2)
-exports.notifyMentionedUsers = onValueCreated(
-  "/social/{groupId}/{postId}",
+// ========== Mentions notification ==========
+exports.notifyMentionedUsers = onDocumentCreated(
+  { document: "social/{groupId}/posts/{postId}", database: "mymor-australia" },
   async (event) => {
-    const post = event.data.val() || {};
+    const post = event.data.data() || {};
     const { groupId, postId } = event.params;
 
     const senderId = post.senderId || "";
@@ -2545,23 +2706,22 @@ exports.notifyMentionedUsers = onValueCreated(
     const targets = mentionUids.filter((u) => u && u !== senderId);
     if (!targets.length) return null;
 
-    const updates = {};
-    const now = Date.now();
+    const now = admin.firestore.FieldValue.serverTimestamp();
 
-    // ✅ Build updates for in-app notifications + idempotency marker
+    // Write in-app notifications + mark mentionNotified (all in one batch)
+    const batch = db.batch();
+
     for (const targetUid of targets) {
-      const already =
-        post &&
-        post.mentionNotified &&
-        post.mentionNotified[targetUid];
+      // skip if already notified (idempotency)
+      if (post.mentionNotified && post.mentionNotified[targetUid]) continue;
 
-      if (already) continue;
-
-      const notifRef = db.ref(`/notifications/${targetUid}`).push();
-      const nid = notifRef.key;
-
-      updates[`/notifications/${targetUid}/${nid}`] = {
-        id: nid,
+      const notifRef = db
+        .collection("users")
+        .doc(targetUid)
+        .collection("notifications")
+        .doc();
+      batch.set(notifRef, {
+        id: notifRef.id,
         type: "mention",
         title: "You were mentioned",
         body: `${senderName} mentioned you in a post`,
@@ -2573,21 +2733,28 @@ exports.notifyMentionedUsers = onValueCreated(
           senderId,
           path: post.path || "",
         },
-      };
-
-      updates[`/social/${groupId}/${postId}/mentionNotified/${targetUid}`] = true;
+      });
     }
 
-    if (Object.keys(updates).length) {
-      await db.ref().update(updates);
-    }
+    // Mark mentionNotified on the post document
+    const postRef = db
+      .collection("social")
+      .doc(groupId)
+      .collection("posts")
+      .doc(postId);
+    const mentionUpdate = {};
+    targets.forEach((uid) => {
+      mentionUpdate[`mentionNotified.${uid}`] = true;
+    });
+    batch.update(postRef, mentionUpdate);
 
-    // ✅ Optional: push notification using your existing hostel token system if possible
-    // If you use tokensForUserId(uid) already, use that:
+    await batch.commit();
+
+    // Send FCM push notifications
     try {
       let allTokens = [];
       for (const targetUid of targets) {
-        const t = await tokensForUserId(targetUid); // <-- your helper at bottom
+        const t = await tokensForUserId(targetUid);
         allTokens = allTokens.concat(t);
       }
 
@@ -2602,7 +2769,7 @@ exports.notifyMentionedUsers = onValueCreated(
           },
           data: {
             type: "mention",
-            screen: "Community", // adjust if you have a post detail screen
+            screen: "Community",
             groupId: String(groupId),
             postId: String(postId),
             senderId: String(senderId || ""),
