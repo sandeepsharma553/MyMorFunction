@@ -2783,3 +2783,232 @@ exports.notifyMentionedUsers = onDocumentCreated(
     return null;
   }
 );
+
+// ============================================================
+// RESTAURANT GROUP (MyMor staff module) — auto-assignment + recurrence
+// Data root: restaurantGroups/{groupId} in the mymor-australia database.
+// ============================================================
+
+const RG_FIELD = admin.firestore.FieldValue;
+
+function rgStepsItemCount(steps) {
+  return (steps || []).reduce((a, s) => a + ((s.items || []).length), 0);
+}
+
+// Frozen snapshots — MUST match the web app's snapshotForAssign / snapshotForChecklist shapes.
+function rgSnapshotForAssign(m) {
+  const total = rgStepsItemCount(m.steps);
+  return { sections: m.steps || [], checks: Array(total).fill(false), itemsTotal: total, link: m.link || "" };
+}
+function rgSnapshotForChecklist(c) {
+  const items = c.items || [];
+  return { items, checks: Array(items.length).fill(false), itemsTotal: items.length, station: c.station || "", area: c.area || "All" };
+}
+
+async function rgNotify(groupId, payload) {
+  try {
+    await db.collection("restaurantGroups").doc(groupId).collection("notifications").add({
+      to: payload.to || "all", // staffId | "managers" | "all"
+      type: payload.type || "info",
+      title: payload.title || "",
+      body: payload.body || "",
+      venueId: payload.venueId || "",
+      by: payload.by || "System",
+      readBy: [],
+      at: RG_FIELD.serverTimestamp(),
+    });
+  } catch (e) {
+    console.error("[rgNotify]", e.message || String(e));
+  }
+}
+
+// When a shift is created: auto-assign role-linked checklists (per shift) and
+// training modules (once per person), then notify the staff member.
+exports.rgOnShiftCreated = onDocumentCreated(
+  {
+    document: "restaurantGroups/{groupId}/venues/{venueId}/shifts/{shiftId}",
+    database: "mymor-australia",
+    region: "us-central1",
+  },
+  async (event) => {
+    const shift = event.data && event.data.data();
+    if (!shift || !shift.staffId) return null;
+    const { groupId, venueId, shiftId } = event.params;
+    const venueRef = db.collection("restaurantGroups").doc(groupId).collection("venues").doc(venueId);
+
+    // shift-created notification (idempotent enough — trigger fires once per doc)
+    await rgNotify(groupId, {
+      to: shift.staffId,
+      type: "shift",
+      title: "New shift",
+      body: `${shift.day != null ? ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][shift.day] + " " : ""}${shift.start || ""}–${shift.end || ""} at ${shift.venue || "your venue"}${shift.role ? " · " + shift.role : ""}`,
+      venueId,
+      by: "Roster",
+    });
+
+    try {
+      // 1) checklists auto-linked to this role (and optionally this start time)
+      const clSnap = await venueRef.collection("checklists").get();
+      for (const d of clSnap.docs) {
+        const c = d.data();
+        // slot-linked checklists are assigned client-side by the shift-slot mechanism
+        // (checklistShiftUtils.js) — skip role-matching so a shift never double-assigns.
+        if (Array.isArray(c.shiftLinks) && c.shiftLinks.length) continue;
+        const auto = c.autoAssign || {};
+        const roles = auto.roles || [];
+        if (!roles.length || !roles.includes(shift.role)) continue;
+        if (auto.shiftStart && auto.shiftStart !== shift.start) continue;
+        if ((c.frequency || "daily") !== "daily") continue; // weekly/monthly handled by the scheduler
+        // respect the checklist's "Runs on" weekdays — don't assign an opening list on a day it doesn't run
+        const shiftWeekday = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][shift.day];
+        if (Array.isArray(c.days) && c.days.length && shiftWeekday && !c.days.includes(shiftWeekday)) continue;
+        const aId = `auto-${d.id}-${shiftId}`; // deterministic → idempotent per shift
+        const aRef = venueRef.collection("checklistAssignments").doc(aId);
+        if ((await aRef.get()).exists) continue;
+        await aRef.set({
+          staffId: shift.staffId,
+          staffName: shift.staffName || "",
+          venueId,
+          venue: shift.venue || "",
+          checklistId: d.id,
+          checklistTitle: c.title || "",
+          ...rgSnapshotForChecklist(c),
+          status: "Not started",
+          progress: 0,
+          auto: true,
+          shiftId,
+          createdAt: RG_FIELD.serverTimestamp(),
+        });
+        await rgNotify(groupId, {
+          to: shift.staffId,
+          type: "checklist",
+          title: "Checklist for your shift",
+          body: `"${c.title}" was assigned for your ${shift.start || ""} shift`,
+          venueId,
+          by: "Auto-assign",
+        });
+      }
+
+      // 2) training modules auto-linked to this role (assigned once per person)
+      const tmSnap = await venueRef.collection("trainingModules").get();
+      for (const d of tmSnap.docs) {
+        const m = d.data();
+        const roles = (m.autoAssign && m.autoAssign.roles) || [];
+        if (!roles.length || !roles.includes(shift.role)) continue;
+        const aId = `auto-${d.id}-${shift.staffId}`; // once per staff member
+        const aRef = venueRef.collection("trainingAssignments").doc(aId);
+        if ((await aRef.get()).exists) continue;
+        await aRef.set({
+          staffId: shift.staffId,
+          staffName: shift.staffName || "",
+          venue: m.venue || shift.venue || "",
+          venueId,
+          moduleId: d.id,
+          moduleTitle: m.title || "",
+          due: "",
+          priority: "normal",
+          notes: "",
+          ...rgSnapshotForAssign(m),
+          status: "Not started",
+          progress: 0,
+          auto: true,
+          createdAt: RG_FIELD.serverTimestamp(),
+        });
+        await rgNotify(groupId, {
+          to: shift.staffId,
+          type: "training",
+          title: "Training assigned",
+          body: `"${m.title}" was assigned to you (rostered as ${shift.role})`,
+          venueId,
+          by: "Auto-assign",
+        });
+      }
+    } catch (e) {
+      console.error("[rgOnShiftCreated]", e.message || String(e));
+    }
+    return null;
+  }
+);
+
+// Daily 03:00 Sydney: materialize weekly/monthly recurring checklists for staff
+// whose role matches, with deterministic ids so re-runs never duplicate.
+exports.rgRecurringChecklists = onSchedule(
+  { schedule: "0 3 * * *", timeZone: "Australia/Sydney", region: "us-central1" },
+  async () => {
+    const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Australia/Sydney" }));
+    const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const weekday = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][now.getDay()];
+    const dayOfMonth = now.getDate();
+
+    const groups = await db.collection("restaurantGroups").get();
+    for (const g of groups.docs) {
+      try {
+        const staffSnap = await g.ref.collection("staff").get();
+        const staff = staffSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const venues = await g.ref.collection("venues").get();
+        for (const v of venues.docs) {
+          const clSnap = await v.ref.collection("checklists").get();
+          for (const d of clSnap.docs) {
+            const c = d.data();
+            // slot-linked checklists are owned by the shift-slot mechanism — never scheduler-assigned
+            if (Array.isArray(c.shiftLinks) && c.shiftLinks.length) continue;
+            const freq = c.frequency || "daily";
+            if (freq === "daily") continue;
+            const due =
+              (freq === "weekly" && (c.scheduleDay || "mon") === weekday) ||
+              (freq === "monthly" && Number(c.scheduleDate || 1) === dayOfMonth);
+            if (!due) continue;
+            const roles = (c.autoAssign && c.autoAssign.roles) || [];
+            const targets = staff.filter(
+              (s) =>
+                (s.status || "Active") === "Active" &&
+                (Array.isArray(s.venueIds) ? s.venueIds.includes(v.id) : s.venueId === v.id) &&
+                (roles.length ? roles.includes(s.role) : /manager|supervisor|in charge/i.test(s.role || ""))
+            );
+            for (const s of targets) {
+              const aId = `rec-${d.id}-${s.id}-${dateKey}`;
+              const aRef = v.ref.collection("checklistAssignments").doc(aId);
+              if ((await aRef.get()).exists) continue;
+              await aRef.set({
+                staffId: s.id,
+                staffName: s.displayName || s.name || [s.first, s.last].filter(Boolean).join(" ") || "",
+                venueId: v.id,
+                venue: c.venue || "",
+                checklistId: d.id,
+                checklistTitle: c.title || "",
+                ...rgSnapshotForChecklist(c),
+                status: "Not started",
+                progress: 0,
+                auto: true,
+                recurring: freq,
+                due: dateKey,
+                createdAt: RG_FIELD.serverTimestamp(),
+              });
+              await rgNotify(g.id, {
+                to: s.id,
+                type: "checklist",
+                title: freq === "weekly" ? "Weekly checklist due" : "Monthly checklist due",
+                body: `"${c.title}" is due today`,
+                venueId: v.id,
+                by: "Scheduler",
+              });
+            }
+            if (targets.length) {
+              await rgNotify(g.id, {
+                to: "managers",
+                type: "checklist",
+                title: `Recurring checklist scheduled`,
+                body: `"${c.title}" (${freq}) was assigned to ${targets.length} staff today`,
+                venueId: v.id,
+                by: "Scheduler",
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.error("[rgRecurringChecklists]", g.id, e.message || String(e));
+      }
+    }
+    return null;
+  }
+);
