@@ -3,7 +3,7 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const { onDocumentUpdated, onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { getFirestore } = require("firebase-admin/firestore");
-const { onRequest } = require("firebase-functions/v2/https");
+const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret } = require("firebase-functions/params");
 const cors = require("cors")({ origin: true });
@@ -3012,3 +3012,212 @@ exports.rgRecurringChecklists = onSchedule(
     return null;
   }
 );
+
+
+// ════════════════════════════════════════════════════════════════════
+// Stock module — rgSellOrder (module #2 centerpiece)
+// One POS sale: deduct every recipe ingredient from the venue's stock
+// inside a single TRANSACTION, write movement records, and raise draft
+// purchase orders when an item crosses its reorder point. POS (#3) must
+// call THIS function — never reimplement the deduction client-side.
+// ════════════════════════════════════════════════════════════════════
+
+// Canonical status rule — keep in sync with
+// MyMorAdmin/src/pages/restaurantgroup/rgStockUtils.js (computeStockStatus).
+function rgStockStatus(qty, reorderPoint, par) {
+  const q = Number(qty) || 0;
+  if (q <= 0) return "critical";
+  if (q <= (Number(reorderPoint) || 0)) return "critical";
+  if (q <= (Number(par) || 0) * 0.5) return "low";
+  return "ok";
+}
+const rgRound4 = (n) => Math.round((Number(n) || 0) * 10000) / 10000;
+
+exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
+  const { groupId, venueId, lines, reference } = request.data || {};
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required.");
+  if (!groupId || !venueId || !Array.isArray(lines) || !lines.length) {
+    throw new HttpsError("invalid-argument", "groupId, venueId and lines[] are required.");
+  }
+  if (lines.length > 50) throw new HttpsError("invalid-argument", "Too many lines (max 50).");
+  for (const l of lines) {
+    const q = Number(l && l.qty == null ? 1 : l && l.qty);
+    if (!l || !l.menuItemId || isNaN(q) || q <= 0 || q > 1000) {
+      throw new HttpsError("invalid-argument", "Each line needs a menuItemId and a qty between 0 and 1000.");
+    }
+  }
+
+  // authorisation: caller must belong to this group and hold stock view+.
+  // Missing permission key fails CLOSED (none), never open.
+  const empSnap = await db.collection("employees").doc(request.auth.uid).get();
+  const emp = empSnap.exists ? empSnap.data() : null;
+  if (!emp || String(emp.groupId || emp.groupid || "") !== String(groupId)) {
+    throw new HttpsError("permission-denied", "Not a member of this group.");
+  }
+  const groupRole = emp.groupRole || "staff";
+  const roleDefaults = {
+    owner: "edit", storeAdmin: "edit", manager: "edit", staff: "none",
+  };
+  const hasExplicit = emp.permissions && !Array.isArray(emp.permissions) && Object.prototype.hasOwnProperty.call(emp.permissions, "stock");
+  // an explicit but malformed value (false, 0, {}) fails CLOSED, not back to the role default
+  const stockPerm = hasExplicit
+    ? (typeof emp.permissions.stock === "string" ? emp.permissions.stock : "none")
+    : (roleDefaults[groupRole] || "none");
+  if (stockPerm !== "view" && stockPerm !== "edit") {
+    throw new HttpsError("permission-denied", "No stock access.");
+  }
+  const actorName = emp.name || emp.email || "POS";
+
+  const groupRef = db.collection("restaurantGroups").doc(String(groupId));
+  const venueRef = groupRef.collection("venues").doc(String(venueId));
+  const ref = String(reference || `SIM-${Date.now().toString().slice(-6)}`).slice(0, 60);
+
+  // ── definitions (stable reference data — read outside the transaction) ──
+  const menuIds = [...new Set(lines.map((l) => String(l.menuItemId)))];
+  const menuSnaps = await db.getAll(...menuIds.map((id) => groupRef.collection("menuItems").doc(id)));
+  const menuById = {};
+  menuSnaps.forEach((s) => { if (s.exists) menuById[s.id] = s.data(); });
+
+  const recipeIds = [...new Set(Object.values(menuById).map((m) => m.recipeId).filter(Boolean))];
+  const recipeSnaps = recipeIds.length ? await db.getAll(...recipeIds.map((id) => groupRef.collection("recipes").doc(id))) : [];
+  const recipeById = {};
+  recipeSnaps.forEach((s) => { if (s.exists) recipeById[s.id] = s.data(); });
+
+  // expand lines → per-movement deductions (provenance per menu item) and
+  // the set of stock docs we must read.
+  const skipped = [];
+  const moves = []; // {itemId, deduct, menuItemId}
+  for (const l of lines) {
+    const mid = String(l.menuItemId);
+    const m = menuById[mid];
+    const lineQty = Number(l.qty == null ? 1 : l.qty);
+    if (!m) { skipped.push({ menuItemId: mid, reason: "Menu item not found" }); continue; }
+    const r = m.recipeId ? recipeById[m.recipeId] : null;
+    if (!r || !Array.isArray(r.ingredients) || !r.ingredients.length) {
+      skipped.push({ menuItemId: mid, reason: `No recipe for ${m.displayName || mid} — link one in Recipe costing` });
+      continue;
+    }
+    for (const ing of r.ingredients) {
+      if (!ing || !ing.itemId) continue;
+      moves.push({ itemId: String(ing.itemId), deduct: rgRound4((Number(ing.qty) || 0) * lineQty), menuItemId: mid, menuName: m.displayName || mid });
+    }
+  }
+  if (!moves.length) return { ok: true, deducted: [], skipped, lowStock: [], draftsCreated: 0 };
+
+  const itemIds = [...new Set(moves.map((mv) => mv.itemId))];
+  const itemSnaps = await db.getAll(...itemIds.map((id) => groupRef.collection("inventoryItems").doc(id)));
+  const itemById = {};
+  itemSnaps.forEach((s) => { if (s.exists) itemById[s.id] = s.data(); });
+
+  // ── the transaction: read stock + draft-PO state, then write everything ──
+  const result = await db.runTransaction(async (tx) => {
+    const stockRefs = itemIds.map((id) => venueRef.collection("stock").doc(id));
+    const stockSnaps = await tx.getAll(...stockRefs);
+    const stockById = {};
+    stockSnaps.forEach((s) => { stockById[s.ref.id] = { ref: s.ref, data: s.exists ? s.data() : null }; });
+
+    // run the deduction math sequentially so before/after chain correctly
+    // when two lines touch the same ingredient.
+    const running = {}; // itemId -> qty
+    const perItemFinal = {};
+    const movements = [];
+    const txSkipped = []; // tx-local: the tx body can retry on contention
+    for (const mv of moves) {
+      const st = stockById[mv.itemId];
+      if (!st || !st.data) { txSkipped.push({ menuItemId: mv.menuItemId, reason: `No stock record for ${mv.itemId} at this venue` }); continue; }
+      const before = running[mv.itemId] != null ? running[mv.itemId] : (Number(st.data.qtyOnHand) || 0);
+      const after = Math.max(0, rgRound4(before - mv.deduct));
+      running[mv.itemId] = after;
+      const item = itemById[mv.itemId] || {};
+      movements.push({
+        itemId: mv.itemId, itemName: item.name || mv.itemId, type: "posSale",
+        // after-before, not -deduct: when the deduction clamps at zero the
+        // audit trail must still sum (before + qtyChange === after).
+        qtyChange: rgRound4(after - before), before, after, unit: item.unit || "",
+        reason: "", reference: ref, menuItemId: mv.menuItemId, menuName: mv.menuName,
+        by: actorName, byUid: request.auth.uid,
+        costAtMove: rgRound4((before - after) * (Number(item.cost) || 0)), // real cost, not the prototype's ×8 fake
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      perItemFinal[mv.itemId] = after;
+    }
+
+    // reorder triggers: read existing open drafts INSIDE the tx so two
+    // concurrent sales cannot both create one (T2.2).
+    const reorderItems = [];
+    for (const [itemId, after] of Object.entries(perItemFinal)) {
+      const st = stockById[itemId].data;
+      if (after <= (Number(st.reorderPoint) || 0)) reorderItems.push(itemId);
+    }
+    const draftChecks = {};
+    for (const itemId of reorderItems) {
+      const qy = groupRef.collection("purchaseOrders")
+        .where("status", "==", "draft").where("venueId", "==", String(venueId)).where("itemKey", "==", itemId);
+      draftChecks[itemId] = await tx.get(qy);
+    }
+
+    // ── writes ──
+    for (const [itemId, after] of Object.entries(perItemFinal)) {
+      const st = stockById[itemId].data;
+      tx.set(stockById[itemId].ref, {
+        qtyOnHand: after,
+        status: rgStockStatus(after, st.reorderPoint, st.par),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
+    for (const m of movements) tx.set(venueRef.collection("stockMovements").doc(), m);
+
+    let draftsCreated = 0;
+    for (const itemId of reorderItems) {
+      const st = stockById[itemId].data;
+      const item = itemById[itemId] || {};
+      const provenance = moves.filter((mv) => mv.itemId === itemId).map((mv) => ({
+        menuItemId: mv.menuItemId, soldQty: mv.deduct, reference: ref, at: new Date().toISOString(),
+      }));
+      const existing = draftChecks[itemId];
+      if (existing && !existing.empty) {
+        tx.set(existing.docs[0].ref, {
+          triggeredBy: admin.firestore.FieldValue.arrayUnion(...provenance),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+        continue; // one open draft per item+venue — never duplicate
+      }
+      const qty = Number(st.reorderQty) || Number(st.par) || 0;
+      if (qty <= 0) continue; // no sensible reorder quantity configured — don't raise a $0 draft
+      const unitCost = Number(item.cost) || 0;
+      tx.set(groupRef.collection("purchaseOrders").doc(), {
+        status: "draft", autoDraft: true, itemKey: itemId,
+        supplierId: item.supplierId || null, venueId: String(venueId),
+        lines: [{ itemId, itemName: item.name || itemId, qty, unitCost, unit: item.unit || "" }],
+        total: rgRound4(qty * unitCost),
+        triggeredBy: provenance,
+        createdBy: "auto", sentAt: null, expectedAt: null, receivedAt: null,
+        receivedLines: [], discrepancies: [], invoiceUrl: "",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      draftsCreated++;
+    }
+
+    const deducted = Object.entries(perItemFinal).map(([itemId, after]) => {
+      const st = stockById[itemId].data;
+      const item = itemById[itemId] || {};
+      return { itemId, name: item.name || itemId, unit: item.unit || "", after, status: rgStockStatus(after, st.reorderPoint, st.par) };
+    });
+    return { deducted, draftsCreated, txSkipped };
+  });
+  skipped.push(...result.txSkipped);
+
+  const lowStock = result.deducted.filter((d) => d.status === "critical" || d.status === "low")
+    .map((d) => `${d.name} now ${d.after}${d.unit}`);
+
+  // low-stock heads-up for managers (after commit; never fails the sale)
+  if (lowStock.length) {
+    await rgNotify(String(groupId), {
+      to: "managers", type: "stock", title: "Low stock after sale",
+      body: lowStock.slice(0, 6).join(", "), venueId: String(venueId), by: actorName,
+    }).catch(() => {});
+  }
+
+  return { ok: true, deducted: result.deducted, skipped, lowStock, draftsCreated: result.draftsCreated };
+});
