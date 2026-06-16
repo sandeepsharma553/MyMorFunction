@@ -3156,6 +3156,10 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
       const after = Math.max(0, rgRound4(before - mv.deduct));
       running[mv.itemId] = after;
       const item = itemById[mv.itemId] || {};
+      // Phase 2 (per-venue cost): cost this movement at the SELLING venue's
+      // weighted-average (stock.cost), falling back to the group last-known
+      // (item.cost). Keep in sync with rgStockUtils.venueCost.
+      const unitCost = (st.data.cost != null && !isNaN(Number(st.data.cost))) ? Number(st.data.cost) : (Number(item.cost) || 0);
       movements.push({
         itemId: mv.itemId, itemName: item.name || mv.itemId, type: "posSale",
         // after-before, not -deduct: when the deduction clamps at zero the
@@ -3163,7 +3167,7 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
         qtyChange: rgRound4(after - before), before, after, unit: item.unit || "",
         reason: "", reference: ref, menuItemId: mv.menuItemId, menuName: mv.menuName,
         by: actorName, byUid: request.auth.uid,
-        costAtMove: rgRound4((before - after) * (Number(item.cost) || 0)), // real cost, not the prototype's ×8 fake
+        costAtMove: rgRound4((before - after) * unitCost), // selling venue's per-venue cost
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       perItemFinal[mv.itemId] = after;
