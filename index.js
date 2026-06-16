@@ -3066,6 +3066,14 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
   if (stockPerm !== "view" && stockPerm !== "edit") {
     throw new HttpsError("permission-denied", "No stock access.");
   }
+  // Phase 0 / Fix 0.2 — per-venue authorisation. Owners/storeAdmins span every
+  // venue in their group; managers/staff may only act on their assigned venue(s).
+  // (An explicit "all" in venueIds/venueId also spans all venues.)
+  const isAdminTier = groupRole === "owner" || groupRole === "storeAdmin";
+  const empVenues = Array.isArray(emp.venueIds) ? emp.venueIds : (emp.venueId ? [emp.venueId] : []);
+  if (!isAdminTier && !empVenues.includes("all") && !empVenues.includes(String(venueId))) {
+    throw new HttpsError("permission-denied", "Not authorized for this venue.");
+  }
   const actorName = emp.name || emp.email || "POS";
 
   const groupRef = db.collection("restaurantGroups").doc(String(groupId));
@@ -3092,6 +3100,12 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
     const m = menuById[mid];
     const lineQty = Number(l.qty == null ? 1 : l.qty);
     if (!m) { skipped.push({ menuItemId: mid, reason: "Menu item not found" }); continue; }
+    // Phase 0 / Fix 0.1 — item-in-venue validation. Don't deduct against a venue
+    // where this menu item isn't sold; skip the line (never bleed, never fail the sale).
+    if (!Array.isArray(m.venueIds) || !m.venueIds.includes(String(venueId))) {
+      skipped.push({ menuItemId: mid, reason: "menu item not sold at this venue" });
+      continue;
+    }
     const r = m.recipeId ? recipeById[m.recipeId] : null;
     if (!r || !Array.isArray(r.ingredients) || !r.ingredients.length) {
       skipped.push({ menuItemId: mid, reason: `No recipe for ${m.displayName || mid} — link one in Recipe costing` });
