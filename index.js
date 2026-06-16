@@ -3113,7 +3113,10 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
     }
     for (const ing of r.ingredients) {
       if (!ing || !ing.itemId) continue;
-      moves.push({ itemId: String(ing.itemId), deduct: rgRound4((Number(ing.qty) || 0) * lineQty), menuItemId: mid, menuName: m.displayName || mid });
+      // Phase 1: carry the recipe-unit qty × lineQty; gross stock deduction is
+      // computed below once item conversion/yield fields are loaded.
+      const recipeUnitQty = Number(ing.netQty != null ? ing.netQty : ing.qty) || 0;
+      moves.push({ itemId: String(ing.itemId), recipeQty: rgRound4(recipeUnitQty * lineQty), menuItemId: mid, menuName: m.displayName || mid });
     }
   }
   if (!moves.length) return { ok: true, deducted: [], skipped, lowStock: [], draftsCreated: 0 };
@@ -3122,6 +3125,16 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
   const itemSnaps = await db.getAll(...itemIds.map((id) => groupRef.collection("inventoryItems").doc(id)));
   const itemById = {};
   itemSnaps.forEach((s) => { if (s.exists) itemById[s.id] = s.data(); });
+
+  // Phase 1: gross stock removed = (recipeQty / stockToRecipe) / (yieldPercent/100).
+  // Keep in sync with rgStockUtils.grossStockQty. Fallbacks (factor→1, yield→100)
+  // make this identical to the old `deduct = qty × lineQty` on un-migrated data.
+  for (const mv of moves) {
+    const item = itemById[mv.itemId] || {};
+    const stockToRecipe = Number(item.stockToRecipe) > 0 ? Number(item.stockToRecipe) : 1;
+    const yieldPct = Number(item.yieldPercent) > 0 ? Number(item.yieldPercent) : 100;
+    mv.deduct = rgRound4((mv.recipeQty / stockToRecipe) / (yieldPct / 100));
+  }
 
   // ── the transaction: read stock + draft-PO state, then write everything ──
   const result = await db.runTransaction(async (tx) => {
