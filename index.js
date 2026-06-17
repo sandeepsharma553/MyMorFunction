@@ -2790,6 +2790,9 @@ exports.notifyMentionedUsers = onDocumentCreated(
 // ============================================================
 
 const RG_FIELD = admin.firestore.FieldValue;
+// Canonical Area→Station→Role auto-assign predicate — shared (byte-identical) with
+// the client's assignmentUtils.shouldAutoAssign so the two halves never disagree.
+const { shouldAutoAssign } = require("./rgAutoAssign");
 
 function rgStepsItemCount(steps) {
   return (steps || []).reduce((a, s) => a + ((s.items || []).length), 0);
@@ -2836,6 +2839,15 @@ exports.rgOnShiftCreated = onDocumentCreated(
     const { groupId, venueId, shiftId } = event.params;
     const venueRef = db.collection("restaurantGroups").doc(groupId).collection("venues").doc(venueId);
 
+    // Load the staff doc so auto-assign can match on the SAME fields the client uses
+    // (area + role + venueIds). If it's missing, fall back to the shift's own fields
+    // (role + this venue, area unknown → never blocks) so we never break assignment.
+    let staffForMatch = { role: shift.role, area: null, venueIds: [venueId] };
+    try {
+      const sd = await db.collection("restaurantGroups").doc(groupId).collection("staff").doc(shift.staffId).get();
+      if (sd.exists) staffForMatch = { id: sd.id, ...sd.data() };
+    } catch (e) { /* keep the shift-based fallback */ }
+
     // shift-created notification (idempotent enough — trigger fires once per doc)
     await rgNotify(groupId, {
       to: shift.staffId,
@@ -2856,12 +2868,16 @@ exports.rgOnShiftCreated = onDocumentCreated(
         if (Array.isArray(c.shiftLinks) && c.shiftLinks.length) continue;
         const auto = c.autoAssign || {};
         const roles = auto.roles || [];
-        if (!roles.length || !roles.includes(shift.role)) continue;
+        // shift-triggered assignment is only for role-targeted checklists (no-roles
+        // checklists are scheduler/owner territory) — preserved guard.
+        if (!roles.length) continue;
         if (auto.shiftStart && auto.shiftStart !== shift.start) continue;
         if ((c.frequency || "daily") !== "daily") continue; // weekly/monthly handled by the scheduler
         // respect the checklist's "Runs on" weekdays — don't assign an opening list on a day it doesn't run
         const shiftWeekday = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][shift.day];
         if (Array.isArray(c.days) && c.days.length && shiftWeekday && !c.days.includes(shiftWeekday)) continue;
+        // Area→Role gate — identical to the client matcher/suggest (was role-only before).
+        if (!shouldAutoAssign(c, staffForMatch, venueId)) continue;
         const aId = `auto-${d.id}-${shiftId}`; // deterministic → idempotent per shift
         const aRef = venueRef.collection("checklistAssignments").doc(aId);
         if ((await aRef.get()).exists) continue;
@@ -2894,7 +2910,9 @@ exports.rgOnShiftCreated = onDocumentCreated(
       for (const d of tmSnap.docs) {
         const m = d.data();
         const roles = (m.autoAssign && m.autoAssign.roles) || [];
-        if (!roles.length || !roles.includes(shift.role)) continue;
+        if (!roles.length) continue; // only role-targeted modules are shift-triggered
+        // Area→Role gate — identical to the client matcher/suggest (was role-only before).
+        if (!shouldAutoAssign(m, staffForMatch, venueId)) continue;
         const aId = `auto-${d.id}-${shift.staffId}`; // once per staff member
         const aRef = venueRef.collection("trainingAssignments").doc(aId);
         if ((await aRef.get()).exists) continue;
@@ -2958,12 +2976,11 @@ exports.rgRecurringChecklists = onSchedule(
               (freq === "weekly" && (c.scheduleDay || "mon") === weekday) ||
               (freq === "monthly" && Number(c.scheduleDate || 1) === dayOfMonth);
             if (!due) continue;
-            const roles = (c.autoAssign && c.autoAssign.roles) || [];
+            // Who gets this recurring checklist — via the SAME Area→Role predicate the
+            // client uses (venue + area + role-targeting, managers when no roles named).
+            // Area gating is NEW; venue/role/manager-fallback behaviour is preserved.
             const targets = staff.filter(
-              (s) =>
-                (s.status || "Active") === "Active" &&
-                (Array.isArray(s.venueIds) ? s.venueIds.includes(v.id) : s.venueId === v.id) &&
-                (roles.length ? roles.includes(s.role) : /manager|supervisor|in charge/i.test(s.role || ""))
+              (s) => (s.status || "Active") === "Active" && shouldAutoAssign(c, s, v.id)
             );
             for (const s of targets) {
               const aId = `rec-${d.id}-${s.id}-${dateKey}`;
