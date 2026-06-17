@@ -1,2 +1,6 @@
 node_modules/
 *.local
+
+# Firebase debug logs — runtime artifacts, never tracked
+firebase-debug.log
+firebase-debug.*.log
