@@ -2792,7 +2792,7 @@ exports.notifyMentionedUsers = onDocumentCreated(
 const RG_FIELD = admin.firestore.FieldValue;
 // Canonical Area→Station→Role auto-assign predicate — shared (byte-identical) with
 // the client's assignmentUtils.shouldAutoAssign so the two halves never disagree.
-const { shouldAutoAssign } = require("./rgAutoAssign");
+const { shouldAutoAssign, areaFromRole } = require("./rgAutoAssign");
 
 function rgStepsItemCount(steps) {
   return (steps || []).reduce((a, s) => a + ((s.items || []).length), 0);
@@ -2839,14 +2839,17 @@ exports.rgOnShiftCreated = onDocumentCreated(
     const { groupId, venueId, shiftId } = event.params;
     const venueRef = db.collection("restaurantGroups").doc(groupId).collection("venues").doc(venueId);
 
-    // Load the staff doc so auto-assign can match on the SAME fields the client uses
-    // (area + role + venueIds). If it's missing, fall back to the shift's own fields
-    // (role + this venue, area unknown → never blocks) so we never break assignment.
-    let staffForMatch = { role: shift.role, area: null, venueIds: [venueId] };
-    try {
-      const sd = await db.collection("restaurantGroups").doc(groupId).collection("staff").doc(shift.staffId).get();
-      if (sd.exists) staffForMatch = { id: sd.id, ...sd.data() };
-    } catch (e) { /* keep the shift-based fallback */ }
+    // Auto-assign off the ROSTERED identity for THIS shift — the role (and the area
+    // derived from it) the person is actually working — NOT their home profile. Staff
+    // work different roles/areas at different venues per shift, so the shift's own role
+    // is the right basis. The shift records role + station but no area, so area is
+    // derived from the rostered role (areaFromRole). venue is this shift's venue.
+    const rostered = {
+      role: shift.role,
+      area: areaFromRole(shift.role),
+      venueIds: [venueId],
+      stationIds: shift.stationId ? [shift.stationId] : [],
+    };
 
     // shift-created notification (idempotent enough — trigger fires once per doc)
     await rgNotify(groupId, {
@@ -2876,8 +2879,8 @@ exports.rgOnShiftCreated = onDocumentCreated(
         // respect the checklist's "Runs on" weekdays — don't assign an opening list on a day it doesn't run
         const shiftWeekday = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][shift.day];
         if (Array.isArray(c.days) && c.days.length && shiftWeekday && !c.days.includes(shiftWeekday)) continue;
-        // Area→Role gate — identical to the client matcher/suggest (was role-only before).
-        if (!shouldAutoAssign(c, staffForMatch, venueId)) continue;
+        // Area→Role gate on the ROSTERED identity (rostered role + derived area).
+        if (!shouldAutoAssign(c, rostered, venueId)) continue;
         const aId = `auto-${d.id}-${shiftId}`; // deterministic → idempotent per shift
         const aRef = venueRef.collection("checklistAssignments").doc(aId);
         if ((await aRef.get()).exists) continue;
@@ -2911,8 +2914,8 @@ exports.rgOnShiftCreated = onDocumentCreated(
         const m = d.data();
         const roles = (m.autoAssign && m.autoAssign.roles) || [];
         if (!roles.length) continue; // only role-targeted modules are shift-triggered
-        // Area→Role gate — identical to the client matcher/suggest (was role-only before).
-        if (!shouldAutoAssign(m, staffForMatch, venueId)) continue;
+        // Area→Role gate on the ROSTERED identity (rostered role + derived area).
+        if (!shouldAutoAssign(m, rostered, venueId)) continue;
         const aId = `auto-${d.id}-${shift.staffId}`; // once per staff member
         const aRef = venueRef.collection("trainingAssignments").doc(aId);
         if ((await aRef.get()).exists) continue;

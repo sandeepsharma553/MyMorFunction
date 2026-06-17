@@ -7,7 +7,7 @@
  *
  * ⚠ KEEP CASES identical to the client parity test. */
 const assert = require("assert");
-const { shouldAutoAssign } = require("../rgAutoAssign");
+const { shouldAutoAssign, areaFromRole } = require("../rgAutoAssign");
 
 const foh = { area: "FOH", role: "FOH", venueIds: ["v1"] };
 const boh = { area: "BOH", role: "BOH", venueIds: ["v1"] };
@@ -56,6 +56,42 @@ assert.deepStrictEqual(
   "FAILED: no-roles checklist should resolve to managers/supervisors"
 );
 pass += 2;
+
+// ── Rostered-role fix: area derived from the shift's role (shift has no area field) ──
+// ⚠ KEEP AREA_CASES + the rostered proof identical to the client parity test.
+const AREA_CASES = [
+  ["FOH", "FOH"],
+  ["FOH — Bar", "FOH"],
+  ["BOH", "BOH"],
+  ["BOH — Kitchen", "BOH"],
+  ["Chef", "BOH"],
+  ["Central Kitchen", "BOH"],
+  ["Store Manager", "Mgmt"],
+  ["FOH Supervisor", "Mgmt"],
+  ["Junior", ""],
+  ["", ""],
+];
+for (const [role, area] of AREA_CASES) {
+  assert.strictEqual(areaFromRole(role), area, `FAILED: areaFromRole(${JSON.stringify(role)})`);
+  pass++;
+}
+
+// rostered identity built from the shift doc (mirrors rgOnShiftCreated)
+const rosteredFromShift = (shift, venueId) => ({
+  role: shift.role,
+  area: areaFromRole(shift.role),
+  venueIds: [venueId],
+  stationIds: shift.stationId ? [shift.stationId] : [],
+});
+// a BOH-home person rostered as FOH gets the FOH item, not the BOH item (home never read)
+const rosteredFOH = rosteredFromShift({ staffId: "x", role: "FOH", venueId: "v1", stationId: "" }, "v1");
+assert.strictEqual(rosteredFOH.area, "FOH", "FAILED: rostered FOH should derive area FOH");
+assert.strictEqual(shouldAutoAssign(clFOHrole, rosteredFOH, "v1"), true, "FAILED: rostered FOH → FOH checklist");
+assert.strictEqual(shouldAutoAssign(mBOHrole, rosteredFOH, "v1"), false, "FAILED: rostered FOH should NOT get BOH module");
+const rosteredBOH = rosteredFromShift({ staffId: "x", role: "BOH", venueId: "v1", stationId: "" }, "v1");
+assert.strictEqual(shouldAutoAssign(mBOHrole, rosteredBOH, "v1"), true, "FAILED: rostered BOH → BOH module");
+assert.strictEqual(shouldAutoAssign(clFOHrole, rosteredBOH, "v1"), false, "FAILED: rostered BOH should NOT get FOH checklist");
+pass += 5;
 
 console.log(`✅ rgAutoAssign parity: ${pass}/${pass} cases pass (matches client truth table).`);
 process.exit(0);

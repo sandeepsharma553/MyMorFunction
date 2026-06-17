@@ -16,6 +16,19 @@
  *   staff   : { area, role, venueIds[]|venueId }
  *   venueId : the venue the item lives in
  * ════════════════════════════════════════════════════════════════════ */
+/* Derive an Area from a role string — used to give a SHIFT a rostered area (shift
+ * docs carry a role + station but no area field). Mirrors the client's Phase-2
+ * staffAreaBucket / ShiftPlanner roleArea regex (no "CK" — Central Kitchen is a venue,
+ * and a "Central Kitchen" role contains "kitchen" → BOH). Unknown → "" so the
+ * shouldAutoAssign "unknown area never blocks" escape applies. */
+function areaFromRole(role) {
+  const r = role || "";
+  if (/manager|owner|admin|supervisor|in charge/i.test(r)) return "Mgmt";
+  if (/foh|floor|\bbar\b|barista|counter|service/i.test(r)) return "FOH";
+  if (/boh|kitchen|chef|grill|fry|wash|prep|cook|dish/i.test(r)) return "BOH";
+  return "";
+}
+
 function shouldAutoAssign(item, staff, venueId) {
   if (!item || !staff) return false;
   // venue membership (multi-venue via venueIds, legacy single venueId)
@@ -39,4 +52,4 @@ function shouldAutoAssign(item, staff, venueId) {
   return true;
 }
 
-module.exports = { shouldAutoAssign };
+module.exports = { shouldAutoAssign, areaFromRole };
