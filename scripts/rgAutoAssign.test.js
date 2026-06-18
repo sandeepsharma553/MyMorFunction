@@ -31,6 +31,15 @@ const clFOHcook = { area: "FOH", autoAssign: { roles: ["Cook"] } };
 const mBOHfoh = { cat: "BOH", autoAssign: { roles: ["FOH"] } };
 const clKitchenFOH = { area: "Kitchen", autoAssign: { roles: ["FOH"] } };
 
+// station HARD-gate (auto-assign) fixtures — kept identical in both repos
+const clFOHbar = { area: "FOH", stationId: "bar", autoAssign: { roles: ["FOH"] } };       // station-specific
+const clFOHnoStn = { area: "FOH", autoAssign: { roles: ["FOH"] } };                       // no station
+const clBarMgr = { area: "FOH", stationId: "bar", autoAssign: { roles: ["Manager"] } };   // station + manager role
+const fohBar = { areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: ["bar"] };    // tagged the station
+const fohNoStn = { areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: [] };       // NOT tagged
+const mgrBar = { areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: ["bar"] };
+const mgrNoStn = { areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: [] };
+
 const CASES = [
   ["role+area match", clFOHrole, foh, "v1", true],
   ["area+role mismatch", clFOHrole, boh, "v1", false],
@@ -50,6 +59,12 @@ const CASES = [
   ["multi-area person does NOT get an out-of-area (Kitchen) item", clKitchenFOH, multiFB, "v1", false],
   ["area 'Mgmt' no longer grants see-all (role-based only)", clFOHcook, cookMgmt, "v1", false],
   ["non-mgr area gate blocks even when the role matches", clFOHcook, cookBOH, "v1", false],
+  // station HARD gate (auto-assign): station-specific item → only station-tagged staff
+  ["station item → station-tagged staff auto-assigned", clFOHbar, fohBar, "v1", true],
+  ["station item → staff missing the station EXCLUDED", clFOHbar, fohNoStn, "v1", false],
+  ["no-station item → station ignored (area/role only)", clFOHnoStn, fohNoStn, "v1", true],
+  ["station item → role-matched MANAGER without the station excluded (no bypass)", clBarMgr, mgrNoStn, "v1", false],
+  ["station item → manager WITH the station auto-assigned", clBarMgr, mgrBar, "v1", true],
 ];
 
 let pass = 0;
