@@ -34,12 +34,15 @@ function shouldAutoAssign(item, staff, venueId) {
   // venue membership (multi-venue via venueIds, legacy single venueId)
   const inVenue = Array.isArray(staff.venueIds) ? staff.venueIds.includes(venueId) : staff.venueId === venueId;
   if (!inVenue) return false;
-  // managers / supervisors / admins see everything (mirrors client staffSeesAll)
-  const seesAll = staff.area === "Mgmt" || /manager|supervisor|in charge|owner|admin/i.test(staff.role || "");
-  // Area (mirrors client moduleForStaff/checklistForStaff): universal "All", exact
-  // area match, or seesAll. An unset staff.area never blocks.
+  // managerial ROLES see everything (mirrors client staffSeesAll). Area-based see-all
+  // (area === "Mgmt") is DROPPED — visibility is exactly the areas in the list.
+  const seesAll = /manager|supervisor|in charge|owner|admin/i.test(staff.role || "");
+  // staff areas as a LIST (backward-compat: fall back to the legacy single area)
+  const sAreas = (Array.isArray(staff.areas) && staff.areas.length) ? staff.areas : (staff.area ? [staff.area] : []);
+  // Area (mirrors client moduleForStaff/checklistForStaff): universal "All", the item
+  // area is among the staff's areas, or seesAll. Unknown areas (empty) never block.
   const itemArea = item.cat || item.area || "All";
-  const areaOk = seesAll || !staff.area || itemArea === "All" || itemArea === staff.area;
+  const areaOk = seesAll || itemArea === "All" || !sAreas.length || sAreas.includes(itemArea);
   if (!areaOk) return false;
   // Role targeting: when the item names roles, staff.role must be one (case-insensitive);
   // when it names none, only seesAll staff are auto-targeted (recurring default = managers).

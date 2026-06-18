@@ -23,6 +23,14 @@ const clFOHnoRole = { area: "FOH" };
 const clBOHnoRole = { area: "BOH" };
 const mBOHrole = { cat: "BOH", autoAssign: { roles: ["BOH"] } };
 
+// multi-area (areas[]) fixtures — the migration's target shape — kept identical in both repos
+const multiFB = { areas: ["FOH", "BOH"], role: "FOH", venueIds: ["v1"] };
+const cookMgmt = { areas: ["Mgmt"], role: "Cook", venueIds: ["v1"] };
+const cookBOH = { areas: ["BOH"], role: "Cook", venueIds: ["v1"] };
+const clFOHcook = { area: "FOH", autoAssign: { roles: ["Cook"] } };
+const mBOHfoh = { cat: "BOH", autoAssign: { roles: ["FOH"] } };
+const clKitchenFOH = { area: "Kitchen", autoAssign: { roles: ["FOH"] } };
+
 const CASES = [
   ["role+area match", clFOHrole, foh, "v1", true],
   ["area+role mismatch", clFOHrole, boh, "v1", false],
@@ -36,6 +44,12 @@ const CASES = [
   ["unknown staff.area never blocks", clFOHrole, fohNoArea, "v1", true],
   ["role match is case-insensitive", clFOHroleLower, foh, "v1", true],
   ["supervisor (sees all) gets no-roles cross-area item", clBOHnoRole, sup, "v1", true],
+  // multi-area (areas[]) + dropped area-based see-all
+  ["multi-area person gets a FOH item", clFOHrole, multiFB, "v1", true],
+  ["multi-area person ALSO gets a BOH item", mBOHfoh, multiFB, "v1", true],
+  ["multi-area person does NOT get an out-of-area (Kitchen) item", clKitchenFOH, multiFB, "v1", false],
+  ["area 'Mgmt' no longer grants see-all (role-based only)", clFOHcook, cookMgmt, "v1", false],
+  ["non-mgr area gate blocks even when the role matches", clFOHcook, cookBOH, "v1", false],
 ];
 
 let pass = 0;
