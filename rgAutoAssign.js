@@ -44,14 +44,12 @@ function shouldAutoAssign(item, staff, venueId) {
   const itemArea = item.cat || item.area || "All";
   const areaOk = seesAll || itemArea === "All" || !sAreas.length || sAreas.includes(itemArea);
   if (!areaOk) return false;
-  // Station HARD gate (AUTO-ASSIGN ONLY — manual assign stays suggest-never-block): a
-  // station-specific item only auto-assigns to staff tagged that station. No station on
-  // the item → station does not restrict. No manager/seesAll bypass here (strict machine).
-  if (item.stationId && !(Array.isArray(staff.stationIds) ? staff.stationIds : []).includes(item.stationId)) return false;
-  // Station-DRIVEN (#3): a station-tagged item auto-assigns to staff at that station
-  // (already gated just above) REGARDLESS of role — station targeting stands on its own.
-  // Role targeting below applies only to items WITHOUT a station. Byte-identical to functions.
-  if (item.stationId) return true;
+  // Station-DRIVEN (AUTO-ASSIGN ONLY — manual assign stays suggest-never-block): targets =
+  // autoAssign.stations (multi-select) else the legacy single stationId. A station-targeted
+  // item auto-assigns to staff tagged ANY of those stations (area already gated), REGARDLESS
+  // of role. Items with NO station targets fall through to role targeting. Byte-identical to client.
+  const stationTargets = (item.autoAssign && item.autoAssign.stations && item.autoAssign.stations.length) ? item.autoAssign.stations : (item.stationId ? [item.stationId] : []);
+  if (stationTargets.length) return (Array.isArray(staff.stationIds) ? staff.stationIds : []).some((id) => stationTargets.includes(id));
   // Role targeting: when the item names roles, staff.role must be one (case-insensitive);
   // when it names none, only seesAll staff are auto-targeted (recurring default = managers).
   const roles = (item.autoAssign && item.autoAssign.roles) || [];

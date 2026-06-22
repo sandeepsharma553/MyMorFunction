@@ -36,6 +36,7 @@ const clFOHbar = { area: "FOH", stationId: "bar", autoAssign: { roles: ["FOH"] }
 const clFOHnoStn = { area: "FOH", autoAssign: { roles: ["FOH"] } };                       // no station
 const clBarMgr = { area: "FOH", stationId: "bar", autoAssign: { roles: ["Manager"] } };   // station + manager role
 const clBarWrongRole = { area: "FOH", stationId: "bar", autoAssign: { roles: ["BOH"] } }; // station + a role the FOH-bar person lacks
+const clMultiStn = { area: "FOH", autoAssign: { roles: [], stations: ["bar", "counter"] } }; // multi-station auto-assign target
 const fohBar = { areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: ["bar"] };    // tagged the station
 const fohNoStn = { areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: [] };       // NOT tagged
 const mgrBar = { areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: ["bar"] };
@@ -68,6 +69,9 @@ const CASES = [
   ["station item → manager WITH the station auto-assigned", clBarMgr, mgrBar, "v1", true],
   // station-DRIVEN (#3): a station-tagged item assigns to station-tagged staff even when the role list doesn't match
   ["station item → station-tagged staff assigned despite role mismatch (station drives)", clBarWrongRole, fohBar, "v1", true],
+  // multi-station auto-assign (autoAssign.stations): staff tagged ANY target station is assigned
+  ["multi-station item → staff at one of the target stations assigned", clMultiStn, fohBar, "v1", true],
+  ["multi-station item → staff at none of the target stations excluded", clMultiStn, fohNoStn, "v1", false],
 ];
 
 let pass = 0;
