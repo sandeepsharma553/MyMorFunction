@@ -35,6 +35,7 @@ const clKitchenFOH = { area: "Kitchen", autoAssign: { roles: ["FOH"] } };
 const clFOHbar = { area: "FOH", stationId: "bar", autoAssign: { roles: ["FOH"] } };       // station-specific
 const clFOHnoStn = { area: "FOH", autoAssign: { roles: ["FOH"] } };                       // no station
 const clBarMgr = { area: "FOH", stationId: "bar", autoAssign: { roles: ["Manager"] } };   // station + manager role
+const clBarWrongRole = { area: "FOH", stationId: "bar", autoAssign: { roles: ["BOH"] } }; // station + a role the FOH-bar person lacks
 const fohBar = { areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: ["bar"] };    // tagged the station
 const fohNoStn = { areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: [] };       // NOT tagged
 const mgrBar = { areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: ["bar"] };
@@ -65,6 +66,8 @@ const CASES = [
   ["no-station item → station ignored (area/role only)", clFOHnoStn, fohNoStn, "v1", true],
   ["station item → role-matched MANAGER without the station excluded (no bypass)", clBarMgr, mgrNoStn, "v1", false],
   ["station item → manager WITH the station auto-assigned", clBarMgr, mgrBar, "v1", true],
+  // station-DRIVEN (#3): a station-tagged item assigns to station-tagged staff even when the role list doesn't match
+  ["station item → station-tagged staff assigned despite role mismatch (station drives)", clBarWrongRole, fohBar, "v1", true],
 ];
 
 let pass = 0;
