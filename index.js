@@ -3470,17 +3470,19 @@ exports.uploadSignedContract = onCall({ region: "us-central1" }, async (request)
   return { ok: true, signedPdfPath: path };
 });
 
-// Short-lived (15-min) V4 signed URL for the signed PDF, minted only after the
-// owner/storeAdmin re-check. Used by the Sent Contracts board + staff-docs UI.
+// Return the signed PDF (base64) for download, only after the owner/storeAdmin re-check.
+// NOTE: we intentionally do NOT mint a V4 signed URL — the Functions runtime service
+// account (…-compute@) lacks iam.serviceAccounts.signBlob, so getSignedUrl fails. Returning
+// the bytes through this gated callable keeps the PDF off any public/tokened URL (pay+PII)
+// and avoids needing to grant Service Account Token Creator.
 exports.getSignedContractUrl = onCall({ region: "us-central1" }, async (request) => {
   const { groupId, contractId } = request.data || {};
   if (!groupId || !contractId) throw new HttpsError("invalid-argument", "groupId and contractId required.");
   await rgAssertGroupAdmin(request.auth && request.auth.uid, groupId);
   const path = `restaurantGroups/${groupId}/contracts/${contractId}/signed.pdf`;
-  const [url] = await admin.storage().bucket(CONTRACTS_BUCKET).file(path).getSignedUrl({
-    action: "read",
-    version: "v4",
-    expires: Date.now() + 15 * 60 * 1000,
-  });
-  return { url };
+  const file = admin.storage().bucket(CONTRACTS_BUCKET).file(path);
+  const [exists] = await file.exists();
+  if (!exists) throw new HttpsError("not-found", "Signed PDF not found.");
+  const [buf] = await file.download();
+  return { base64: buf.toString("base64"), filename: `signed_${contractId}.pdf` };
 });
