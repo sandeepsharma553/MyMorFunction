@@ -1,0 +1,24 @@
+{
+  "template": {
+    "sections": [
+      { "heading": "EMPLOYMENT AGREEMENT", "body": ["Employee: {{employee_name}}"] },
+      { "heading": "Remuneration", "body": ["Rate ${{hourly_rate}}/hr, Level {{classification_level}}."] }
+    ],
+    "conditional": { "guardian": { "when": "minor", "body": ["Guardian Signature: ____  Date: ____"] } }
+  },
+  "contract": {
+    "isMinor": true,
+    "extraClauses": "Must hold RSA before first shift.\nUniform provided.",
+    "values": { "employee_name": "Mei", "hourly_rate": "25.80" }
+  },
+  "expectedBlocks": [
+    { "t": "h", "text": "EMPLOYMENT AGREEMENT" },
+    { "t": "p", "text": "Employee: Mei" },
+    { "t": "h", "text": "Remuneration" },
+    { "t": "p", "text": "Rate $25.80/hr, Level ‹classification_level›." },
+    { "t": "p", "text": "Guardian Signature: ____  Date: ____" },
+    { "t": "h", "text": "Additional Terms" },
+    { "t": "p", "text": "Must hold RSA before first shift." },
+    { "t": "p", "text": "Uniform provided." }
+  ]
+}
