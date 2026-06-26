@@ -3272,3 +3272,132 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
 
   return { ok: true, deducted: result.deducted, skipped, lowStock, draftsCreated: result.draftsCreated };
 });
+
+/* ============================================================================
+   Contract Generator (Phase 1, Step 6) — server-side PDF + send.
+   The PDF is rendered from the SAME shared module the client preview uses
+   (lib/contractFill — byte-identical to the client copy, enforced by
+   verify-fill-parity), so preview ≡ PDF. The generated PDF is ephemeral
+   (returned / emailed), never persisted here (signed PDF = Step 7).
+   ========================================================================== */
+const contractFill = require("./lib/contractFill");
+const PdfPrinter = require("pdfmake");
+const _vfs = require("pdfmake/build/vfs_fonts");
+const _vfsObj = (_vfs.pdfMake && _vfs.pdfMake.vfs) || _vfs.vfs || _vfs;
+const PDF_FONTS = { Roboto: {
+  normal: Buffer.from(_vfsObj["Roboto-Regular.ttf"], "base64"),
+  bold: Buffer.from(_vfsObj["Roboto-Medium.ttf"], "base64"),
+  italics: Buffer.from(_vfsObj["Roboto-Italic.ttf"], "base64"),
+  bolditalics: Buffer.from(_vfsObj["Roboto-MediumItalic.ttf"], "base64"),
+} };
+
+// employees schema confirmed live: field `groupId` (camelCase; no `groupid`), `groupRole`
+// in owner|storeAdmin|manager|staff. Owner/storeAdmin only — never trust the client.
+async function rgAssertGroupAdmin(uid, groupId) {
+  if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+  const snap = await db.collection("employees").doc(uid).get();
+  const emp = snap.exists ? snap.data() : null;
+  if (!emp || emp.groupId !== groupId) {
+    throw new HttpsError("permission-denied", "Not a member of this group.");
+  }
+  if (emp.groupRole !== "owner" && emp.groupRole !== "storeAdmin") {
+    throw new HttpsError("permission-denied", "Owner/Store Admin only.");
+  }
+  return emp;
+}
+
+// Build the pdfmake docDefinition from the SAME assembled blocks the preview renders.
+function rgBuildContractDocDef(template, contract) {
+  const blocks = contractFill.assemble(template, contract);
+  const content = blocks.map((b) => (b.t === "h"
+    ? { text: b.text, bold: true, fontSize: 12, margin: [0, 8, 0, 2] }
+    : { text: b.text, fontSize: 9, margin: [0, 0, 0, 2] }));
+  return { content, defaultStyle: { font: "Roboto" }, pageSize: "A4", pageMargins: [40, 40, 40, 40] };
+}
+
+async function rgRenderContractPdfBase64(groupId, contractId) {
+  const cSnap = await db.doc(`restaurantGroups/${groupId}/contracts/${contractId}`).get();
+  if (!cSnap.exists) throw new HttpsError("not-found", "Contract not found.");
+  const contract = cSnap.data();
+  const tSnap = await db.doc(`restaurantGroups/${groupId}/contractTemplates/${contract.templateId}`).get();
+  if (!tSnap.exists) throw new HttpsError("failed-precondition", "Contract template missing.");
+  const printer = new PdfPrinter(PDF_FONTS);
+  const pdfDoc = printer.createPdfKitDocument(rgBuildContractDocDef(tSnap.data(), contract));
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    pdfDoc.on("data", (c) => chunks.push(c));
+    pdfDoc.on("end", () => resolve(Buffer.concat(chunks).toString("base64")));
+    pdfDoc.on("error", reject);
+    pdfDoc.end();
+  });
+}
+
+// Return the PDF (base64). Used by an optional Download and reused by sendContract.
+exports.renderContractPdf = onCall({ region: "us-central1" }, async (request) => {
+  const { groupId, contractId } = request.data || {};
+  if (!groupId || !contractId) throw new HttpsError("invalid-argument", "groupId and contractId required.");
+  await rgAssertGroupAdmin(request.auth && request.auth.uid, groupId);
+  const base64 = await rgRenderContractPdfBase64(groupId, contractId);
+  return { base64, filename: `contract_${contractId}.pdf` };
+});
+
+// Render + email the contract via the EXISTING SMTP pipeline; mark status "sent"
+// (= submitted to SMTP, NOT a delivery receipt). Guards: double-send + empty-token.
+exports.sendContract = onCall(
+  { region: "us-central1", secrets: [SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS] },
+  async (request) => {
+    const { groupId, contractId, confirmEmpty, resend, testTo } = request.data || {};
+    if (!groupId || !contractId) throw new HttpsError("invalid-argument", "groupId and contractId required.");
+    await rgAssertGroupAdmin(request.auth && request.auth.uid, groupId);
+
+    const ref = db.doc(`restaurantGroups/${groupId}/contracts/${contractId}`);
+    const cSnap = await ref.get();
+    if (!cSnap.exists) throw new HttpsError("not-found", "Contract not found.");
+    const contract = cSnap.data();
+
+    // double-send guard — explicit resend required to re-email an employee
+    if (contract.status === "sent" && !resend) {
+      throw new HttpsError("failed-precondition", "ALREADY_SENT");
+    }
+
+    // server-authoritative empty-token guard (mirrors the client confirm; can't be bypassed)
+    const tSnap = await db.doc(`restaurantGroups/${groupId}/contractTemplates/${contract.templateId}`).get();
+    if (!tSnap.exists) throw new HttpsError("failed-precondition", "Contract template missing.");
+    const tokenKeys = tSnap.data().tokenKeys || [];
+    const emptyCount = tokenKeys.filter((t) => {
+      const x = contract.values ? contract.values[t] : undefined;
+      return !(x !== undefined && x !== null && String(x).trim() !== "");
+    }).length;
+    if (emptyCount && !confirmEmpty) {
+      throw new HttpsError("failed-precondition", `EMPTY_FIELDS:${emptyCount}`);
+    }
+
+    // recipient: testTo (rollout gate) overrides; else the employee's contact email
+    const to = String(testTo || contract.employeeContactEmail || "").trim();
+    if (!to) throw new HttpsError("failed-precondition", "No recipient email on file.");
+
+    const base64 = await rgRenderContractPdfBase64(groupId, contractId);
+    const v = contract.values || {};
+    await getSmtpTransporter().sendMail({
+      from: `MyMor <${SMTP_USER.value()}>`,
+      to,
+      subject: `Your employment agreement — ${v.employer_name || "MyMor"}`,
+      text: `Hi ${v.employee_first_name || ""},\n\n` +
+        "Please find attached your employment agreement. Review it, then sign and return a copy to us.\n" +
+        "If anything looks incorrect, reply to this email before signing.\n\n" +
+        `Kind regards,\n${v.owner_name || "Management"}`,
+      attachments: [{ filename: `contract_${contractId}.pdf`, content: Buffer.from(base64, "base64"), contentType: "application/pdf" }],
+    });
+
+    // status "sent" == submitted to SMTP (handoff accepted) — NOT delivery proof.
+    // A test send (testTo) is a dry email and does NOT mutate status.
+    if (!testTo) {
+      await ref.update({
+        status: "sent",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        sentBy: request.auth.uid,
+      });
+    }
+    return { ok: true, submittedToSmtp: true, testSend: !!testTo };
+  }
+);
