@@ -3401,3 +3401,86 @@ exports.sendContract = onCall(
     return { ok: true, submittedToSmtp: true, testSend: !!testTo };
   }
 );
+
+/* ============================================================================
+   Contract Generator (Phase 1, Step 7) — signed-PDF upload + gated download.
+   Signed contracts are pay + PII: NO client Storage access (storage.rules deny
+   the contracts subtree). These callables do the owner/storeAdmin re-check and
+   perform the object I/O via the Admin SDK (which bypasses Storage rules).
+   No public download token is ever minted — reads go through a short-lived
+   V4 signed URL from getSignedContractUrl.
+   ========================================================================== */
+const CONTRACTS_BUCKET = "mymor-one"; // AU bucket the app uses (firebase.js getStorage)
+
+// Admin uploads the signed PDF the employee returned. Validates it is really a PDF,
+// writes it, advances the lifecycle to "signed", and reuses the staff signDocs[] array.
+exports.uploadSignedContract = onCall({ region: "us-central1" }, async (request) => {
+  const { groupId, contractId, base64 } = request.data || {};
+  if (!groupId || !contractId || !base64) {
+    throw new HttpsError("invalid-argument", "groupId, contractId and base64 are required.");
+  }
+  const emp = await rgAssertGroupAdmin(request.auth && request.auth.uid, groupId);
+
+  const ref = db.doc(`restaurantGroups/${groupId}/contracts/${contractId}`);
+  const cSnap = await ref.get();
+  if (!cSnap.exists) throw new HttpsError("not-found", "Contract not found.");
+  const contract = cSnap.data();
+
+  // VALIDATE: must be a real PDF (magic bytes) within a sane size — no silent accept.
+  const buf = Buffer.from(base64, "base64");
+  if (buf.length < 5 || buf.slice(0, 5).toString("latin1") !== "%PDF-") {
+    throw new HttpsError("invalid-argument", "Uploaded file is not a PDF.");
+  }
+  if (buf.length > 15 * 1024 * 1024) {
+    throw new HttpsError("invalid-argument", "File too large (max 15MB).");
+  }
+
+  const path = `restaurantGroups/${groupId}/contracts/${contractId}/signed.pdf`;
+  await admin.storage().bucket(CONTRACTS_BUCKET).file(path)
+    .save(buf, { contentType: "application/pdf", resumable: false });
+
+  // lifecycle → signed
+  await ref.update({
+    status: "signed",
+    signedAt: admin.firestore.FieldValue.serverTimestamp(),
+    signedPdfPath: path,
+    signedBy: request.auth.uid,
+  });
+
+  // REUSE the existing staff signDocs[] array (NOT a parallel store). fileUrl is left
+  // empty on purpose — pay+PII, so downloads go through the gated getSignedContractUrl.
+  const actorName = emp.name || emp.displayName || emp.email || "Admin";
+  const nowISO = new Date().toISOString();
+  if (contract.staffId) {
+    await db.doc(`restaurantGroups/${groupId}/staff/${contract.staffId}`).update({
+      signDocs: admin.firestore.FieldValue.arrayUnion({
+        id: `contract_${contractId}`,
+        name: "Signed employment agreement",
+        contractId,
+        filePath: path,
+        fileUrl: "",
+        uploadedAt: nowISO,
+        uploadedBy: actorName,
+        signedAt: nowISO,
+        signedBy: actorName,
+      }),
+    });
+  }
+
+  return { ok: true, signedPdfPath: path };
+});
+
+// Short-lived (15-min) V4 signed URL for the signed PDF, minted only after the
+// owner/storeAdmin re-check. Used by the Sent Contracts board + staff-docs UI.
+exports.getSignedContractUrl = onCall({ region: "us-central1" }, async (request) => {
+  const { groupId, contractId } = request.data || {};
+  if (!groupId || !contractId) throw new HttpsError("invalid-argument", "groupId and contractId required.");
+  await rgAssertGroupAdmin(request.auth && request.auth.uid, groupId);
+  const path = `restaurantGroups/${groupId}/contracts/${contractId}/signed.pdf`;
+  const [url] = await admin.storage().bucket(CONTRACTS_BUCKET).file(path).getSignedUrl({
+    action: "read",
+    version: "v4",
+    expires: Date.now() + 15 * 60 * 1000,
+  });
+  return { url };
+});
