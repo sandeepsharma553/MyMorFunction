@@ -1,0 +1,260 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() { return request.auth != null; }
+    function userHostelId() { return isSignedIn() ? request.auth.token.hostelId : null; }
+    function hostelActive(hid) {
+      return get(/databases/$(database)/documents/hostel/$(hid)).data.active == true;
+    }
+
+    // ── Restaurant Groups (multi-venue restaurant clients) ──
+    function rgHasEmp() {
+      return isSignedIn() && exists(/databases/$(database)/documents/employees/$(request.auth.uid));
+    }
+    function rgEmp() {
+      return get(/databases/$(database)/documents/employees/$(request.auth.uid)).data;
+    }
+    function rgIsSuper() {
+      return isSignedIn() && (
+        request.auth.token.role == 'superadmin' ||
+        request.auth.token.type == 'superadmin' ||
+        (rgHasEmp() && rgEmp().type == 'superadmin')
+      );
+    }
+    function rgIsGroupMember(groupId) { return rgHasEmp() && rgEmp().groupId == groupId; }
+    function rgGroupRoleIn(gid, roles) {
+      return rgHasEmp() && rgEmp().groupId == gid && (rgEmp().groupRole in roles);
+    }
+    function rgIsGroupAdmin(gid)   { return rgGroupRoleIn(gid, ['owner', 'storeAdmin']); }
+    function rgCanManageStaff(gid) { return rgGroupRoleIn(gid, ['owner', 'storeAdmin', 'manager']); }
+    function rgIsGroupUser() { return rgHasEmp() && rgEmp().get('groupId', null) != null; }
+    function rgStaff(gid, sid) { return get(/databases/$(database)/documents/restaurantGroups/$(gid)/staff/$(sid)).data; }
+    function rgIsOwnStaff(gid, sid) {
+      return sid != null
+        && exists(/databases/$(database)/documents/restaurantGroups/$(gid)/staff/$(sid))
+        && (rgStaff(gid, sid).adminUid == request.auth.uid
+            || (request.auth.token.email != null && rgStaff(gid, sid).get('email', '') == request.auth.token.email));
+    }
+    // NEW: can this signed-in user approve leave? owner/storeAdmin always, OR an
+    // explicit permissions.leave == 'approve' grant on their employees doc.
+    function rgCanApproveLeave(gid) {
+      return rgIsGroupAdmin(gid)
+        || (rgHasEmp() && rgEmp().groupId == gid
+            && rgEmp().get('permissions', {}).get('leave', '') == 'approve');
+    }
+
+    match /restaurantGroups/{groupId} {
+      allow read:   if rgIsSuper() || rgIsGroupMember(groupId);
+      allow create: if rgIsSuper();
+      allow update, delete: if rgIsSuper() || rgIsGroupAdmin(groupId);
+
+      match /staff/{staffId} {
+        allow read:  if rgIsSuper() || rgIsGroupMember(groupId);
+        allow write: if rgIsSuper() || rgCanManageStaff(groupId);
+
+        // 🔒 Sensitive payroll (TFN / bank / super) — owner/storeAdmin only.
+        match /private/{doc=**} {
+          allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+        }
+
+        // Per-staff acknowledgements — the staff member, or a manager/owner.
+        match /acknowledgements/{version} {
+          allow read:           if rgIsSuper() || rgCanManageStaff(groupId) || rgIsOwnStaff(groupId, staffId);
+          allow create, update: if rgIsSuper() || rgCanManageStaff(groupId) || rgIsOwnStaff(groupId, staffId);
+          allow delete:         if rgIsSuper() || rgCanManageStaff(groupId);
+        }
+      }
+      // ── Contract Generator (Documents module) — owner/storeAdmin only ──
+      // Templates are seeded out-of-band (Admin SDK); the app only READS them.
+      match /contractTemplates/{templateId} {
+        allow read:  if rgIsSuper() || rgIsGroupAdmin(groupId);
+        allow write: if rgIsSuper();
+      }
+      // Contract defaults live in a gated settings/ subcollection (NOT the group doc).
+      match /settings/contractDefaults {
+        allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+      }
+      match /contracts/{contractId} {
+         allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+      }
+      match /settings/contractClassifications {
+  			allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+			}
+      match /settings/legalEntities {
+        allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+      }
+      match /venues/{venueId} {
+        allow read, write: if rgIsSuper() || rgIsGroupMember(groupId);
+
+        // Operational per-venue data (checklists, tempLogs, shifts, stations, equipment,
+        // trainingModules/Assignments, checklistAssignments, kpis, performanceNotes, …) —
+        // any group member. EXCLUDES leaveRequests and the cost/stock collections, which
+        // each have their own tighter block below. (Firestore ORs overlapping matches, so
+        // the only way to NARROW is to exclude here — same pattern as leaveRequests.)
+        match /{coll}/{docId=**} {
+          allow read, write: if (rgIsSuper() || rgIsGroupMember(groupId))
+            && !(coll in ['leaveRequests', 'shifts', 'timeEntries', 'availability', 'stock', 'stockMovements', 'stocktakes', 'batches', 'production']);
+        }
+
+        // ── Stock / cost collections — manager+ ONLY (matches can('stock') =
+        // owner/storeAdmin/manager; staff is stock:none). Holds cost, weighted-avg,
+        // variance $, production cost. Server (rgSellOrder, Admin SDK) bypasses rules.
+        match /stock/{docId=**}          { allow read, write: if rgIsSuper() || rgCanManageStaff(groupId); }
+        match /stockMovements/{docId=**} { allow read, write: if rgIsSuper() || rgCanManageStaff(groupId); }
+        match /stocktakes/{docId=**}     { allow read, write: if rgIsSuper() || rgCanManageStaff(groupId); }
+        match /batches/{docId=**}        { allow read, write: if rgIsSuper() || rgCanManageStaff(groupId); }
+        match /production/{docId=**}     { allow read, write: if rgIsSuper() || rgCanManageStaff(groupId); }
+
+        // ── CHANGED BLOCK ── approve/update now requires leave-approve permission
+        // (owner/storeAdmin, or an explicit permissions.leave=='approve' grant),
+        // matching the app's `approve` permission level. Submit-your-own unchanged.
+        match /leaveRequests/{leaveId} {
+          allow read:   if rgIsSuper() || rgIsGroupMember(groupId);
+          allow create: if rgIsSuper() || rgCanManageStaff(groupId)
+                        || (rgIsGroupMember(groupId) && rgIsOwnStaff(groupId, request.resource.data.staffId));
+          allow update, delete: if rgIsSuper() || rgCanApproveLeave(groupId);
+        }
+        // ── END CHANGED BLOCK ──
+
+        // ── Availability feature (kiosk clock + availability + assignment) ──
+        // Roster (shifts): any group member READS; only managers+ WRITE. Closes the
+        // previous open hole where any member could write any shift via the catch-all.
+        match /shifts/{shiftId} {
+          allow read:  if rgIsSuper() || rgIsGroupMember(groupId);
+          allow write: if rgIsSuper() || rgCanManageStaff(groupId);
+        }
+        // Time clock: the kiosk is a SHARED terminal — the signed-in device account writes
+        // on behalf of staff (identity is the in-app PIN, NOT auth.uid). So create/update are
+        // group-member; delete is managers+. (Manager "approve" is an update by a manager.)
+        match /timeEntries/{entryId} {
+          allow read:   if rgIsSuper() || rgIsGroupMember(groupId);
+          allow create: if rgIsSuper() || rgIsGroupMember(groupId);
+          allow update: if rgIsSuper() || rgIsGroupMember(groupId);
+          allow delete: if rgIsSuper() || rgCanManageStaff(groupId);
+
+          match /breaks/{breakId} {
+            allow read:  if rgIsSuper() || rgIsGroupMember(groupId);
+            allow write: if rgIsSuper() || rgIsGroupMember(groupId);
+          }
+        }
+        // Availability posting: same shared-terminal model — group-member create/update,
+        // managers+ delete.
+        match /availability/{availId} {
+          allow read:   if rgIsSuper() || rgIsGroupMember(groupId);
+          allow create: if rgIsSuper() || rgIsGroupMember(groupId);
+          allow update: if rgIsSuper() || rgIsGroupMember(groupId);
+          allow delete: if rgIsSuper() || rgCanManageStaff(groupId);
+        }
+      }
+
+      // ── Stock / Menus / Supplier (Module #2) — group-level shared collections ──
+      // Inventory / suppliers / POs: manager+ (cost & supplier-pricing data).
+      // Menu / modifier groups: readable by group members (floor/POS need them); writes manager+.
+      // Recipes: read tightened to manager+ (expose food-cost composition).
+      match /inventoryItems/{itemId} {
+        allow read, write: if rgIsSuper() || rgCanManageStaff(groupId);
+      }
+      match /menuItems/{menuItemId} {
+        // ⚠ COST-FIELD TENSION (flagged): doc contains `cost`. Kept member-read so POS/
+        // floor can read sellPrice/variants/modifierGroupIds. See review §2 for options.
+        allow read:  if rgIsSuper() || rgIsGroupMember(groupId);
+        allow write: if rgIsSuper() || rgCanManageStaff(groupId);
+      }
+      match /recipes/{recipeId} {
+        // Read tightened to manager+: recipes reveal food-cost build (ingredient qty ×
+        // inventory cost). No staff client screen reads them; POS deducts server-side.
+        allow read:  if rgIsSuper() || rgCanManageStaff(groupId);
+        allow write: if rgIsSuper() || rgCanManageStaff(groupId);
+      }
+      match /modifierGroups/{modId} {
+        allow read:  if rgIsSuper() || rgIsGroupMember(groupId);
+        allow write: if rgIsSuper() || rgCanManageStaff(groupId);
+      }
+      match /suppliers/{supplierId} {
+        // Read manager+ (supplier:view). Write owner/storeAdmin only (supplier:edit);
+        // managers are view-only and don't edit the directory from the client.
+        allow read:  if rgIsSuper() || rgCanManageStaff(groupId);
+        allow write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+      }
+      match /purchaseOrders/{poId} {
+        // Write tightened to owner/storeAdmin (supplier:edit). Managers are
+        // supplier:view and don't create/approve POs from the client; auto-draft
+        // POs are written by the rgSellOrder CF (Admin SDK). Read unchanged at manager+.
+        allow read:  if rgIsSuper() || rgCanManageStaff(groupId);
+        allow write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+      }
+
+      // ── Compliance & Award (your recent work) — read: members; write: manager+ ──
+      match /awardRates/{awardCode} {
+        allow read:  if rgIsSuper() || rgIsGroupMember(groupId);
+        allow write: if rgIsSuper() || rgCanManageStaff(groupId);
+      }
+      match /compliance/{docId} {
+        allow read:  if rgIsSuper() || rgIsGroupMember(groupId);
+        allow write: if rgIsSuper() || rgCanManageStaff(groupId);
+      }
+
+      // ── Messaging / notifications (group members) ──
+      match /notifications/{notificationId} {
+        allow read, write: if rgIsSuper() || rgIsGroupMember(groupId);
+      }
+      match /conversations/{conversationId}/{rest=**} {
+        allow read, write: if rgIsSuper() || rgIsGroupMember(groupId);
+      }
+
+      match /auditLog/{docId}      { allow read, write: if rgIsSuper() || rgIsGroupMember(groupId); }
+      match /announcements/{docId} { allow read, write: if rgIsSuper() || rgIsGroupMember(groupId); }
+      match /messages/{docId}      { allow read, write: if rgIsSuper() || rgIsGroupMember(groupId); }
+    }
+
+    match /hostel/{hid} {
+      allow read:           if isSignedIn() && request.auth.token.role == 'superadmin';
+      allow create, update: if isSignedIn() && (request.auth.token.role == 'superadmin' || request.auth.token.type == 'superadmin');
+      allow delete:         if isSignedIn() && (request.auth.token.role == 'superadmin' || resource.data.adminUID == null);
+    }
+
+    match /adminMenuState/{uid}/menus/{menuKey} {
+      allow read, write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    match /employees/{empId} {
+      allow read, write: if isSignedIn() && userHostelId() != null
+        && resource.data.hostelid == userHostelId()
+        && hostelActive(userHostelId());
+      allow read:   if isSignedIn() && request.auth.uid == empId;
+      allow create: if rgIsSuper() || rgCanManageStaff(request.resource.data.groupId);
+      allow update: if rgIsSuper() || rgCanManageStaff(resource.data.groupId);
+    }
+
+    match /users/{uid} {
+      allow read, write: if isSignedIn() && userHostelId() != null
+        && resource.data.hostelid == userHostelId()
+        && hostelActive(userHostelId());
+      allow read:   if isSignedIn() && request.auth.uid == uid;
+      allow create: if rgIsSuper() || rgCanManageStaff(request.resource.data.groupId);
+      allow update: if rgIsSuper() || rgCanManageStaff(resource.data.groupId) || request.auth.uid == uid;
+    }
+
+    // Locked: confirmed unused by every app/function (real verification runs
+    // through Cloud Functions writing emailOtps via the Admin SDK).
+    match /emailVerifications/{email} { allow read, write: if false; }
+
+    // OTP collections are written/read ONLY by Cloud Functions (Admin SDK, which
+    // bypasses rules). Deny all client access so email + code hash aren't exposed
+    // to signed-in users via the bottom catch-all.
+    match /emailOtps/{id}         { allow read, write: if false; }
+    match /passwordResetOtps/{id} { allow read, write: if false; }
+
+    match /events/{eventId}           { allow read: if request.auth != null; }
+    match /eventBookings/{docId}      { allow read: if request.auth != null && request.auth.uid == resource.data.userId; }
+    match /User/{userId}              { allow read: if request.auth.uid == userId; }
+    match /eventcategory/{docId}      { allow read: if true; }
+    match /University/{document}      { allow read:  if true; allow write: if isSignedIn(); }
+    match /discoverfile/{uid}/{allPaths=**} { allow write: if request.auth.uid == uid; }
+
+    match /{coll}/{rest=**} {
+      allow read, write: if isSignedIn() && coll != 'restaurantGroups' && !rgIsGroupUser();
+    }
+  }
+}
