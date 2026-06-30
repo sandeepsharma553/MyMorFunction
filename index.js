@@ -3033,6 +3033,74 @@ exports.rgRecurringChecklists = onSchedule(
   }
 );
 
+// ── Public holidays: yearly auto-refresh from Nager.Date ──
+// Fetches AU holidays (current + next year) and merges into each group's
+// publicHolidays settings doc. Preserves owner/seed entries (source !== "api");
+// only refreshes API-sourced dates. NEVER writes if the fetch failed or returned
+// nothing — so a bad fetch can never wipe an owner's list.
+exports.rgRefreshPublicHolidays = onSchedule(
+  { schedule: "0 4 1 * *", timeZone: "Australia/Sydney", region: "us-central1" },
+  async () => {
+    const thisYear = new Date(new Date().toLocaleString("en-US", { timeZone: "Australia/Sydney" })).getFullYear();
+    const years = [thisYear, thisYear + 1];
+
+    const api = []; // {date, name, state, source:"api"}
+    for (const y of years) {
+      try {
+        const resp = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${y}/AU`);
+        if (!resp.ok) { console.error(`[rgRefreshPublicHolidays] ${y} HTTP ${resp.status}`); continue; }
+        const data = await resp.json();
+        if (!Array.isArray(data)) { console.error(`[rgRefreshPublicHolidays] ${y} bad payload`); continue; }
+        for (const h of data) {
+          if (!h || !h.date) continue;
+          const name = h.localName || h.name || "Public holiday";
+          if (h.global === true || !Array.isArray(h.counties) || h.counties.length === 0) {
+            api.push({ date: h.date, name, state: "ALL", source: "api" });
+          } else {
+            for (const c of h.counties) {
+              api.push({ date: h.date, name, state: String(c).replace(/^AU-/, ""), source: "api" });
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[rgRefreshPublicHolidays] fetch ${y} failed:`, e.message || String(e));
+      }
+    }
+
+    // SAFETY: nothing fetched → touch nothing (never wipe owner data on a bad fetch).
+    if (!api.length) { console.warn("[rgRefreshPublicHolidays] no holidays fetched — skipping all writes"); return; }
+
+    const groups = await db.collection("restaurantGroups").get();
+    for (const g of groups.docs) {
+      try {
+        const vSnap = await g.ref.collection("venues").get();
+        const states = new Set();
+        vSnap.forEach((v) => { const st = (v.data() || {}).state; if (st) states.add(st); });
+
+        const relevant = api.filter((h) => h.state === "ALL" || states.has(h.state));
+
+        const phRef = g.ref.collection("settings").doc("publicHolidays");
+        const snap = await phRef.get();
+        const existing = snap.exists ? (snap.data().holidays || []) : [];
+
+        // preserve owner/seed entries (source !== "api"); owner wins on date+state collision
+        const owner = existing.filter((h) => h.source !== "api");
+        const merged = [
+          ...owner,
+          ...relevant.filter((a) => !owner.some((o) => o.date === a.date && o.state === a.state)),
+        ].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+        await phRef.set(
+          { holidays: merged, holidaysFetchedAt: RG_FIELD.serverTimestamp(), holidaysSource: "nager.date" },
+          { merge: true }
+        );
+      } catch (e) {
+        console.error(`[rgRefreshPublicHolidays] group ${g.id}:`, e.message || String(e));
+      }
+    }
+  }
+);
+
 
 // ════════════════════════════════════════════════════════════════════
 // Stock module — rgSellOrder (module #2 centerpiece)
