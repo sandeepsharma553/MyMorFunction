@@ -40,6 +40,21 @@ function sha256(str) {
 function otpHash(email, code, otpSecret) {
   return sha256(`${String(email).toLowerCase().trim()}:${code}:${otpSecret}`);
 }
+
+// ── Venue-state normalisation (restaurant groups) ──
+// Map free-text / variant state to a canonical AU_STATES code, or null if unknown. Never guesses.
+// Kept in sync with MyMorAdmin/src/pages/restaurantgroup/publicHolidays.js (normalizeState/venueState).
+const AU_STATES = ["NSW", "VIC", "QLD", "SA", "WA", "TAS", "ACT", "NT"];
+const rgNormalizeState = (raw) => {
+  if (!raw) return null;
+  const s = String(raw).trim().toUpperCase();
+  if (AU_STATES.includes(s)) return s;
+  const NAMES = { "NEW SOUTH WALES": "NSW", "VICTORIA": "VIC", "QUEENSLAND": "QLD", "SOUTH AUSTRALIA": "SA", "WESTERN AUSTRALIA": "WA", "TASMANIA": "TAS", "AUSTRALIAN CAPITAL TERRITORY": "ACT", "NORTHERN TERRITORY": "NT" };
+  return NAMES[s] || null;
+};
+// Venue's state for PH matching: top-level state (in-app VenueManager) OR address.state
+// (super-admin console), normalised to a code.
+const rgVenueStateOf = (data) => rgNormalizeState((data || {}).state ?? (data || {}).address?.state ?? null);
 let smtpTransporter = null;
 function getSmtpTransporter() {
   if (smtpTransporter) return smtpTransporter;
@@ -3075,7 +3090,7 @@ exports.rgRefreshPublicHolidays = onSchedule(
       try {
         const vSnap = await g.ref.collection("venues").get();
         const states = new Set();
-        vSnap.forEach((v) => { const st = (v.data() || {}).state; if (st) states.add(st); });
+        vSnap.forEach((v) => { const st = rgVenueStateOf(v.data()); if (st) states.add(st); });
 
         const relevant = api.filter((h) => h.state === "ALL" || states.has(h.state));
 
