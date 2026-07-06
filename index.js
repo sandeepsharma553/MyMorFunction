@@ -3183,35 +3183,142 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
   const venueRef = groupRef.collection("venues").doc(String(venueId));
   const ref = String(reference || `SIM-${Date.now().toString().slice(-6)}`).slice(0, 60);
 
+  // ── Order envelope input (module #3 groundwork). Everything here is OPTIONAL —
+  // legacy demo-sell callers send only { groupId, venueId, lines, reference } and
+  // still work unchanged (they just produce a minimal dine-in order document).
+  const orderMeta = (request.data && typeof request.data.orderMeta === "object" && request.data.orderMeta) || {};
+  const SERVICE_MODES = ["dinein", "takeaway", "delivery", "pickup"];
+  const serviceMode = SERVICE_MODES.includes(orderMeta.serviceMode) ? orderMeta.serviceMode : "dinein";
+  // pre-generate the order id so it can be returned after the transaction commits
+  const orderRef = venueRef.collection("orders").doc();
+
   // ── definitions (stable reference data — read outside the transaction) ──
   const menuIds = [...new Set(lines.map((l) => String(l.menuItemId)))];
   const menuSnaps = await db.getAll(...menuIds.map((id) => groupRef.collection("menuItems").doc(id)));
   const menuById = {};
   menuSnaps.forEach((s) => { if (s.exists) menuById[s.id] = s.data(); });
 
-  const recipeIds = [...new Set(Object.values(menuById).map((m) => m.recipeId).filter(Boolean))];
+  // ── per-venue menu INSTANCES (template+instance model). Instance existence IS
+  // the "sold at this venue" gate (replaces the old venueIds check — no template
+  // fallback at sale time). linked:true inherits the template; linked:false
+  // ("separate") carries its own values. Keep in sync with
+  // rgStockUtils.resolveMenuItemAtVenue (client copy).
+  const instSnaps = await db.getAll(...menuIds.map((id) => venueRef.collection("menuItems").doc(id)));
+  const instById = {};
+  instSnaps.forEach((s) => { if (s.exists) instById[s.id] = s.data(); });
+  const INSTANCE_OVERRIDE_FIELDS = ["sellPrice", "variants", "hasVariants", "variantGroupName", "modifierGroupIds", "recipeId"];
+  const INSTANCE_STATE_FIELDS = ["linked", "available", "e86", "e86Reason", "e86By", "e86At", "e86Back", "recipeSourceId"];
+  const rgResolveAtVenue = (m, inst) => {
+    if (!m || !inst) return null;
+    let rm;
+    if (inst.linked === false) {
+      rm = { ...m };
+      Object.entries(inst).forEach(([k, v]) => { if (v !== undefined && v !== null) rm[k] = v; });
+      rm._mode = "separate";
+    } else {
+      rm = { ...m, _mode: "linked" };
+      for (const k of INSTANCE_OVERRIDE_FIELDS) if (inst[k] !== undefined && inst[k] !== null) rm[k] = inst[k];
+      for (const k of INSTANCE_STATE_FIELDS) if (inst[k] !== undefined) rm[k] = inst[k];
+    }
+    if (inst.modifierOverrides && Array.isArray(inst.modifierOverrides.modifierGroupIds)) {
+      rm.modifierGroupIds = inst.modifierOverrides.modifierGroupIds; // per-venue attachment override
+    }
+    rm._optionPrices = (inst.modifierOverrides && inst.modifierOverrides.optionPrices) || null; // { [groupId]: { [label]: delta } }
+    return rm;
+  };
+  const resolvedById = {};
+  Object.keys(menuById).forEach((id) => {
+    const rm = rgResolveAtVenue(menuById[id], instById[id]);
+    if (rm) resolvedById[id] = rm;
+  });
+
+  // recipes/modifiers are loaded off the RESOLVED items, so a separate instance's
+  // own recipeId / modifier attachments are honoured at deduction+pricing time.
+  const recipeIds = [...new Set(Object.values(resolvedById).map((m) => m.recipeId).filter(Boolean))];
   const recipeSnaps = recipeIds.length ? await db.getAll(...recipeIds.map((id) => groupRef.collection("recipes").doc(id))) : [];
   const recipeById = {};
   recipeSnaps.forEach((s) => { if (s.exists) recipeById[s.id] = s.data(); });
+
+  // modifier price deltas are resolved SERVER-SIDE from the item's attached
+  // modifierGroups — client-sent deltas are never trusted. Loaded only when a
+  // line actually carries modifiers (zero extra reads for legacy callers).
+  const anyMods = lines.some((l) => l && Array.isArray(l.modifiers) && l.modifiers.length);
+  const modGroupIds = anyMods
+    ? [...new Set(Object.values(resolvedById).flatMap((m) => (Array.isArray(m.modifierGroupIds) ? m.modifierGroupIds : [])))]
+    : [];
+  const modGroupSnaps = modGroupIds.length ? await db.getAll(...modGroupIds.map((id) => groupRef.collection("modifierGroups").doc(id))) : [];
+  const modGroupById = {};
+  modGroupSnaps.forEach((s) => { if (s.exists) modGroupById[s.id] = s.data(); });
 
   // expand lines → per-movement deductions (provenance per menu item) and
   // the set of stock docs we must read.
   const skipped = [];
   const moves = []; // {itemId, deduct, menuItemId}
+  const orderLines = []; // priced order lines — includes recipe-less items (sold ≠ deducted)
   for (const l of lines) {
     const mid = String(l.menuItemId);
     const m = menuById[mid];
     const lineQty = Number(l.qty == null ? 1 : l.qty);
     if (!m) { skipped.push({ menuItemId: mid, reason: "Menu item not found" }); continue; }
-    // Phase 0 / Fix 0.1 — item-in-venue validation. Don't deduct against a venue
-    // where this menu item isn't sold; skip the line (never bleed, never fail the sale).
-    if (!Array.isArray(m.venueIds) || !m.venueIds.includes(String(venueId))) {
-      skipped.push({ menuItemId: mid, reason: "menu item not sold at this venue" });
+    // Template+instance gate — the venue sells this item ONLY if an instance doc
+    // exists at venues/{v}/menuItems/{templateId}. Replaces the old venueIds
+    // check; there is NO template fallback at sale time.
+    const rm = resolvedById[mid];
+    if (!rm) {
+      skipped.push({ menuItemId: mid, reason: "not sold at this venue" });
       continue;
     }
-    const r = m.recipeId ? recipeById[m.recipeId] : null;
+    const inst = instById[mid];
+
+    // ── price resolution (template+instance): instance.sellPrice (explicit
+    // per-venue override, both modes) → legacy template.venuePrices[venueId]
+    // (Option A data) → resolved sellPrice (= template's when linked).
+    // Keep in sync with rgStockUtils.resolveMenuItemAtVenue / venueSellPrice.
+    let unitPrice;
+    if (inst.sellPrice != null && !isNaN(Number(inst.sellPrice))) {
+      unitPrice = Number(inst.sellPrice);
+    } else {
+      const vpRaw = m.venuePrices ? m.venuePrices[String(venueId)] : undefined;
+      const vpNum = Number(vpRaw);
+      unitPrice = vpRaw != null && !isNaN(vpNum) ? vpNum : (Number(rm.sellPrice) || 0);
+    }
+    let variantLabel = null;
+    if (rm.hasVariants && l.variantLabel && Array.isArray(rm.variants)) {
+      // resolved variants: a separate instance's own list, else the template's
+      const variant = rm.variants.find((v) => v && v.label === String(l.variantLabel));
+      if (variant) { unitPrice = Number(variant.sellPrice) || 0; variantLabel = variant.label; }
+    }
+    const mods = [];
+    if (Array.isArray(l.modifiers)) {
+      for (const md of l.modifiers.slice(0, 20)) {
+        const label = md && md.label != null ? String(md.label).slice(0, 60) : "";
+        if (!label) continue;
+        let delta = 0;
+        for (const gid of (Array.isArray(rm.modifierGroupIds) ? rm.modifierGroupIds : [])) {
+          // instance option-price override first, else the shared group's delta
+          const ovp = rm._optionPrices && rm._optionPrices[gid];
+          if (ovp && ovp[label] != null && !isNaN(Number(ovp[label]))) { delta = Number(ovp[label]); break; }
+          const opt = ((modGroupById[gid] || {}).options || []).find((o) => o && o.label === label);
+          if (opt) { delta = Number(opt.priceDelta) || 0; break; }
+        }
+        mods.push({ label, priceDelta: delta }); // unmatched label → $0 delta (never client-priced)
+      }
+    }
+    const modsDelta = mods.reduce((s, x) => s + x.priceDelta, 0);
+    orderLines.push({
+      menuItemId: mid, name: rm.displayName || mid, qty: lineQty,
+      unitPrice: rgRound4(unitPrice), variantLabel, modifiers: mods,
+      notes: l.notes != null ? String(l.notes).slice(0, 200) : "",
+      course: l.course != null ? String(l.course).slice(0, 40) : "",
+      gstApplicable: rm.gstApplicable !== false,
+      lineTotal: rgRound4(lineQty * (unitPrice + modsDelta)),
+    });
+
+    // resolved recipe: a separate instance deducts through its OWN cloned recipe
+    const r = rm.recipeId ? recipeById[rm.recipeId] : null;
     if (!r || !Array.isArray(r.ingredients) || !r.ingredients.length) {
-      skipped.push({ menuItemId: mid, reason: `No recipe for ${m.displayName || mid} — link one in Recipe costing` });
+      // sold but NOT deducted — the line stays on the order; only the deduction is skipped
+      skipped.push({ menuItemId: mid, reason: `No recipe for ${rm.displayName || mid} — link one in Recipe costing` });
       continue;
     }
     for (const ing of r.ingredients) {
@@ -3219,13 +3326,23 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
       // Phase 1: carry the recipe-unit qty × lineQty; gross stock deduction is
       // computed below once item conversion/yield fields are loaded.
       const recipeUnitQty = Number(ing.netQty != null ? ing.netQty : ing.qty) || 0;
-      moves.push({ itemId: String(ing.itemId), recipeQty: rgRound4(recipeUnitQty * lineQty), menuItemId: mid, menuName: m.displayName || mid });
+      moves.push({ itemId: String(ing.itemId), recipeQty: rgRound4(recipeUnitQty * lineQty), menuItemId: mid, menuName: rm.displayName || mid });
     }
   }
-  if (!moves.length) return { ok: true, deducted: [], skipped, lowStock: [], draftsCreated: 0 };
+  // nothing sellable at all (every line unknown or not sold at this venue) —
+  // legacy shape preserved, no order document is written.
+  if (!moves.length && !orderLines.length) {
+    return { ok: true, orderId: null, orderNumber: null, amounts: null, deducted: [], skipped, lowStock: [], draftsCreated: 0 };
+  }
+
+  // ── order amounts (ex-GST base — one base rule; GST mirrors rgStockUtils.incGst @ 10%) ──
+  const subtotal = rgRound4(orderLines.reduce((s, ol) => s + ol.lineTotal, 0));
+  const gst = rgRound4(orderLines.reduce((s, ol) => s + (ol.gstApplicable ? ol.lineTotal * 0.1 : 0), 0));
+  const amounts = { subtotal, gst, discountTotal: 0, total: rgRound4(subtotal + gst) };
 
   const itemIds = [...new Set(moves.map((mv) => mv.itemId))];
-  const itemSnaps = await db.getAll(...itemIds.map((id) => groupRef.collection("inventoryItems").doc(id)));
+  // an all-recipe-less order has zero moves — getAll() with no refs throws, so guard
+  const itemSnaps = itemIds.length ? await db.getAll(...itemIds.map((id) => groupRef.collection("inventoryItems").doc(id))) : [];
   const itemById = {};
   itemSnaps.forEach((s) => { if (s.exists) itemById[s.id] = s.data(); });
 
@@ -3242,7 +3359,7 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
   // ── the transaction: read stock + draft-PO state, then write everything ──
   const result = await db.runTransaction(async (tx) => {
     const stockRefs = itemIds.map((id) => venueRef.collection("stock").doc(id));
-    const stockSnaps = await tx.getAll(...stockRefs);
+    const stockSnaps = stockRefs.length ? await tx.getAll(...stockRefs) : [];
     const stockById = {};
     stockSnaps.forEach((s) => { stockById[s.ref.id] = { ref: s.ref, data: s.exists ? s.data() : null }; });
 
@@ -3301,6 +3418,39 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
     }
     for (const m of movements) tx.set(venueRef.collection("stockMovements").doc(), m);
 
+    // ── the ORDER document (module #3) — written INSIDE this same transaction so
+    // order + stock deduction commit atomically (never one without the other).
+    // customer/discounts/payment/loyalty are placeholder shapes — their systems
+    // are not built yet. This order envelope exists so those can populate it
+    // later without a schema migration.
+    tx.set(orderRef, {
+      orderNumber: ref,
+      groupId: String(groupId), venueId: String(venueId),
+      serviceMode,
+      status: "placed", // status timeline starts here — transitions are not built yet
+      // ISO string, not serverTimestamp(): Firestore forbids the sentinel inside arrays
+      statusHistory: [{ status: "placed", at: new Date().toISOString(), by: request.auth.uid }],
+      lines: orderLines,
+      // lines dropped from the sale + lines sold without a stock deduction, for reconciliation
+      deductionSkips: [...skipped, ...txSkipped],
+      customer: orderMeta.customer && typeof orderMeta.customer === "object"
+        ? {
+          name: orderMeta.customer.name != null ? String(orderMeta.customer.name).slice(0, 80) : null,
+          phone: orderMeta.customer.phone != null ? String(orderMeta.customer.phone).slice(0, 25) : null,
+        }
+        : null, // CRM not built yet
+      tableNumber: orderMeta.tableNumber != null ? String(orderMeta.tableNumber).slice(0, 20) : null, // FOH not built yet
+      covers: Number(orderMeta.covers) > 0 ? Number(orderMeta.covers) : null,
+      amounts, // { subtotal, gst, discountTotal: 0, total } — ex-GST base + 10% GST
+      discounts: [], // discount system not built yet
+      payment: { status: "unpaid", method: null }, // payment system not built yet
+      loyalty: { pointsEarned: 0 }, // loyalty not built yet
+      reference: ref,
+      by: request.auth.uid, byName: actorName,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
     let draftsCreated = 0;
     for (const itemId of reorderItems) {
       const st = stockById[itemId].data;
@@ -3353,7 +3503,11 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
     }).catch(() => {});
   }
 
-  return { ok: true, deducted: result.deducted, skipped, lowStock, draftsCreated: result.draftsCreated };
+  return {
+    ok: true,
+    orderId: orderRef.id, orderNumber: ref, amounts,
+    deducted: result.deducted, skipped, lowStock, draftsCreated: result.draftsCreated,
+  };
 });
 
 /* ============================================================================
