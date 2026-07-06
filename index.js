@@ -3526,6 +3526,15 @@ const PDF_FONTS = { Roboto: {
   bold: Buffer.from(_vfsObj["Roboto-Medium.ttf"], "base64"),
   italics: Buffer.from(_vfsObj["Roboto-Italic.ttf"], "base64"),
   bolditalics: Buffer.from(_vfsObj["Roboto-MediumItalic.ttf"], "base64"),
+},
+// "Arial" = Liberation Sans (metrically identical, SIL-OFL — fonts/LICENSE-LiberationSans.txt).
+// Roboto is KEPT alongside as a fallback. pdfmake accepts font file paths; the fonts/
+// folder deploys with the function source, so __dirname resolves at runtime.
+Arial: {
+  normal: `${__dirname}/fonts/LiberationSans-Regular.ttf`,
+  bold: `${__dirname}/fonts/LiberationSans-Bold.ttf`,
+  italics: `${__dirname}/fonts/LiberationSans-Italic.ttf`,
+  bolditalics: `${__dirname}/fonts/LiberationSans-BoldItalic.ttf`,
 } };
 
 // employees schema confirmed live: field `groupId` (camelCase; no `groupid`), `groupRole`
@@ -3543,13 +3552,34 @@ async function rgAssertGroupAdmin(uid, groupId) {
   return emp;
 }
 
+// Heading LEVEL inferred from the block TEXT — assemble() blocks are flat {t,text} with no
+// level field, so: Title = first heading or uppercase-heavy; H1 = "1. …"; H2 = "1.1 …";
+// anything else falls back to a uniform bold heading (never breaks on odd text).
+// STYLING ONLY — block content/order untouched. Mirrored in the admin preview
+// (ContractGeneratorPage) so preview look ≡ PDF look.
+function rgHeadingStyle(text, isFirst) {
+  const s = String(text || "");
+  const letters = s.replace(/[^a-zA-Z]/g, "");
+  const upperHeavy = letters.length >= 4 && letters === letters.toUpperCase();
+  if (isFirst || upperHeavy) return { bold: true, fontSize: 14, alignment: "center", margin: [0, 0, 0, 10] }; // Title
+  if (/^\d+\.\d+/.test(s)) return { bold: true, fontSize: 11, margin: [12, 6, 0, 2] };  // H2 (check before H1)
+  if (/^\d+\.\s/.test(s)) return { bold: true, fontSize: 12, margin: [0, 10, 0, 3] };   // H1
+  return { bold: true, fontSize: 11, margin: [0, 8, 0, 2] };                            // graceful fallback
+}
+
 // Build the pdfmake docDefinition from the SAME assembled blocks the preview renders.
 function rgBuildContractDocDef(template, contract) {
   const blocks = contractFill.assemble(template, contract);
-  const content = blocks.map((b) => (b.t === "h"
-    ? { text: b.text, bold: true, fontSize: 12, margin: [0, 8, 0, 2] }
-    : { text: b.text, fontSize: 9, margin: [0, 0, 0, 2] }));
-  return { content, defaultStyle: { font: "Roboto" }, pageSize: "A4", pageMargins: [40, 40, 40, 40] };
+  let firstHeadingSeen = false;
+  const content = blocks.map((b) => {
+    if (b.t === "h") {
+      const isFirst = !firstHeadingSeen;
+      firstHeadingSeen = true;
+      return { text: b.text, ...rgHeadingStyle(b.text, isFirst) };
+    }
+    return { text: b.text, fontSize: 11, alignment: "justify", lineHeight: 1.15, margin: [0, 0, 0, 6] };
+  });
+  return { content, defaultStyle: { font: "Arial", fontSize: 11 }, pageSize: "A4", pageMargins: [57, 57, 57, 57] };
 }
 
 async function rgRenderContractPdfBase64(groupId, contractId) {
