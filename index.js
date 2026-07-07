@@ -3189,6 +3189,21 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
   const orderMeta = (request.data && typeof request.data.orderMeta === "object" && request.data.orderMeta) || {};
   const SERVICE_MODES = ["dinein", "takeaway", "delivery", "pickup"];
   const serviceMode = SERVICE_MODES.includes(orderMeta.serviceMode) ? orderMeta.serviceMode : "dinein";
+  // ── per-staff POS attribution: orderMeta.staff = { id } is WHO TOOK the order
+  // (PIN-identified on the shared POS device), distinct from `by` = the signed-in
+  // login. The id is validated against the group's staff collection and the NAME
+  // is taken from the staff doc — a client-sent name or unknown id is never
+  // trusted/stored. Optional: legacy callers without it produce staffId:null.
+  let staffId = null;
+  let staffName = null;
+  if (orderMeta.staff && typeof orderMeta.staff === "object" && orderMeta.staff.id) {
+    const sSnap = await groupRef.collection("staff").doc(String(orderMeta.staff.id)).get();
+    if (sSnap.exists) {
+      const sd = sSnap.data();
+      staffId = sSnap.id;
+      staffName = sd.displayName || sd.name || [sd.first, sd.last].filter(Boolean).join(" ") || null;
+    }
+  }
   // pre-generate the order id so it can be returned after the transaction commits
   const orderRef = venueRef.collection("orders").doc();
 
@@ -3447,6 +3462,7 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
       loyalty: { pointsEarned: 0 }, // loyalty not built yet
       reference: ref,
       by: request.auth.uid, byName: actorName,
+      staffId, staffName, // who TOOK the order (PIN-identified) — per-staff sales attribution
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
