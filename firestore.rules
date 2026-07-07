@@ -43,6 +43,13 @@ service cloud.firestore {
         || (rgHasEmp() && rgEmp().groupId == gid
             && rgEmp().get('permissions', {}).get('leave', '') == 'approve');
     }
+    // Mirrors rgCanApproveLeave: owner/storeAdmin always, OR an explicit
+    // permissions.availability == 'approve' grant on their employees doc.
+    function rgCanApproveAvailability(gid) {
+      return rgIsGroupAdmin(gid)
+        || (rgHasEmp() && rgEmp().groupId == gid
+            && rgEmp().get('permissions', {}).get('availability', '') == 'approve');
+    }
 
     match /restaurantGroups/{groupId} {
       allow read:   if rgIsSuper() || rgIsGroupMember(groupId);
@@ -79,10 +86,14 @@ service cloud.firestore {
          allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
       }
       match /settings/contractClassifications {
-  			allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
-			}
+        allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+      }
       match /settings/legalEntities {
         allow read, write: if rgIsSuper() || rgIsGroupAdmin(groupId);
+      }
+      match /settings/publicHolidays {
+        allow read:  if rgIsSuper() || rgIsGroupMember(groupId);
+        allow write: if rgIsSuper() || rgIsGroupAdmin(groupId);
       }
       match /venues/{venueId} {
         allow read, write: if rgIsSuper() || rgIsGroupMember(groupId);
@@ -94,7 +105,7 @@ service cloud.firestore {
         // the only way to NARROW is to exclude here — same pattern as leaveRequests.)
         match /{coll}/{docId=**} {
           allow read, write: if (rgIsSuper() || rgIsGroupMember(groupId))
-            && !(coll in ['leaveRequests', 'shifts', 'timeEntries', 'availability', 'stock', 'stockMovements', 'stocktakes', 'batches', 'production']);
+            && !(coll in ['leaveRequests', 'shifts', 'timeEntries', 'availability', 'stock', 'stockMovements', 'stocktakes', 'batches', 'production', 'orders']);
         }
 
         // ── Stock / cost collections — manager+ ONLY (matches can('stock') =
@@ -105,6 +116,14 @@ service cloud.firestore {
         match /stocktakes/{docId=**}     { allow read, write: if rgIsSuper() || rgCanManageStaff(groupId); }
         match /batches/{docId=**}        { allow read, write: if rgIsSuper() || rgCanManageStaff(groupId); }
         match /production/{docId=**}     { allow read, write: if rgIsSuper() || rgCanManageStaff(groupId); }
+
+        // ── Orders (POS) — server-write-only, manager-read. Orders are created ONLY by
+        // rgSellOrder (Admin SDK, bypasses rules) inside its stock transaction. No client
+        // may write/forge an order. Managers+ may READ for the live-orders view.
+        match /orders/{docId=**} {
+          allow read: if rgIsSuper() || rgCanManageStaff(groupId);
+          allow write: if false;
+        }
 
         // ── CHANGED BLOCK ── approve/update now requires leave-approve permission
         // (owner/storeAdmin, or an explicit permissions.leave=='approve' grant),
@@ -138,12 +157,26 @@ service cloud.firestore {
             allow write: if rgIsSuper() || rgIsGroupMember(groupId);
           }
         }
-        // Availability posting: same shared-terminal model — group-member create/update,
-        // managers+ delete.
+        // Availability posting: shared-kiosk model — the device account posts on behalf of
+        // PIN-identified staff, so create/update stay group-member. A non-approver may only
+        // write status 'pending' (post / re-post resets review) or leave status unchanged;
+        // setting accepted/rejected requires the availability-approve grant.
+        // COUNTER-PROPOSE: a group member may also move a doc a manager set to 'proposed'
+        // → 'accepted' or 'declined' (the staffer answering on the iPad). Bounded to that
+        // exact stored→incoming transition, so it can't jump pending→accepted.
         match /availability/{availId} {
           allow read:   if rgIsSuper() || rgIsGroupMember(groupId);
-          allow create: if rgIsSuper() || rgIsGroupMember(groupId);
-          allow update: if rgIsSuper() || rgIsGroupMember(groupId);
+          allow create: if rgIsSuper()
+            || (rgIsGroupMember(groupId)
+                && (request.resource.data.get('status', 'pending') == 'pending'
+                    || rgCanApproveAvailability(groupId)));
+          allow update: if rgIsSuper()
+            || (rgIsGroupMember(groupId)
+                && (request.resource.data.get('status', 'pending') == 'pending'
+                    || request.resource.data.get('status', 'pending') == resource.data.get('status', 'pending')
+                    || rgCanApproveAvailability(groupId)
+                    || (resource.data.get('status', '') == 'proposed'
+                        && request.resource.data.get('status', '') in ['accepted', 'declined'])));
           allow delete: if rgIsSuper() || rgCanManageStaff(groupId);
         }
       }
