@@ -61,4 +61,4 @@ function shouldAutoAssign(item, staff, venueId) {
   return true;
 }
 
-module.exports = { shouldAutoAssign, areaFromRole };
+module.exports = {shouldAutoAssign, areaFromRole};

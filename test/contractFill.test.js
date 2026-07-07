@@ -7,13 +7,13 @@ const contractFill = require("../lib/contractFill");
 const fx = require("./contractFill.fixture.json");
 
 assert.deepStrictEqual(
-  contractFill.assemble(fx.template, fx.contract),
-  fx.expectedBlocks,
-  "assemble() output must match the golden fixture (order + minor + extras + empty token)"
+    contractFill.assemble(fx.template, fx.contract),
+    fx.expectedBlocks,
+    "assemble() output must match the golden fixture (order + minor + extras + empty token)",
 );
 assert.strictEqual(
-  contractFill.line("a {{x}} b {{y}}", { x: "1" }),
-  "a 1 b ‹y›",
-  "line() must fill non-empty tokens and flag empties as ‹token›"
+    contractFill.line("a {{x}} b {{y}}", {x: "1"}),
+    "a 1 b ‹y›",
+    "line() must fill non-empty tokens and flag empties as ‹token›",
 );
 console.log("contractFill (functions) golden test: PASS");

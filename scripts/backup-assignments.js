@@ -9,8 +9,8 @@ const fs = require("fs");
 const admin = require("firebase-admin");
 
 const SA = process.env.RG_SA || "/Users/mac/Projects/MyMorAdmin/secrets/serviceAccount.json";
-admin.initializeApp({ credential: admin.credential.cert(require(SA)) });
-const { getFirestore } = require("firebase-admin/firestore");
+admin.initializeApp({credential: admin.credential.cert(require(SA))});
+const {getFirestore} = require("firebase-admin/firestore");
 const DB_ID = process.env.RG_DATABASE_ID || "mymor-australia";
 const db = getFirestore(admin.app(), DB_ID);
 
@@ -18,7 +18,7 @@ const db = getFirestore(admin.app(), DB_ID);
   console.log(`Backup assignments — db=${DB_ID} (READ-ONLY)\n`);
   const training = [];
   const checklist = [];
-  let groups = 0, venues = 0;
+  let groups = 0; let venues = 0;
   const gSnap = await db.collection("restaurantGroups").get();
   for (const g of gSnap.docs) {
     groups++;
@@ -26,15 +26,15 @@ const db = getFirestore(admin.app(), DB_ID);
     for (const v of vSnap.docs) {
       venues++;
       const ta = await v.ref.collection("trainingAssignments").get();
-      ta.forEach((d) => training.push({ groupId: g.id, venueId: v.id, id: d.id, data: d.data() }));
+      ta.forEach((d) => training.push({groupId: g.id, venueId: v.id, id: d.id, data: d.data()}));
       const ca = await v.ref.collection("checklistAssignments").get();
-      ca.forEach((d) => checklist.push({ groupId: g.id, venueId: v.id, id: d.id, data: d.data() }));
+      ca.forEach((d) => checklist.push({groupId: g.id, venueId: v.id, id: d.id, data: d.data()}));
     }
   }
 
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const dir = path.resolve(__dirname, "../backups");
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, {recursive: true});
   const file = path.join(dir, `assignments-${DB_ID}-${stamp}.json`);
   fs.writeFileSync(file, JSON.stringify({
     db: DB_ID, exportedAt: new Date().toISOString(), groups, venues,
@@ -45,4 +45,6 @@ const db = getFirestore(admin.app(), DB_ID);
   console.log(`groups=${groups} venues=${venues} trainingAssignments=${training.length} checklistAssignments=${checklist.length}`);
   console.log(`written: ${file}`);
   process.exit(0);
-})().catch((e) => { console.error("FAILED:", e.message); process.exit(1); });
+})().catch((e) => {
+  console.error("FAILED:", e.message); process.exit(1);
+});

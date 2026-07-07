@@ -7,40 +7,40 @@
  *
  * ⚠ KEEP CASES identical to the client parity test. */
 const assert = require("assert");
-const { shouldAutoAssign, areaFromRole } = require("../rgAutoAssign");
+const {shouldAutoAssign, areaFromRole} = require("../rgAutoAssign");
 
-const foh = { area: "FOH", role: "FOH", venueIds: ["v1"] };
-const boh = { area: "BOH", role: "BOH", venueIds: ["v1"] };
-const mgr = { area: "Mgmt", role: "Manager", venueIds: ["v1"] };
-const sup = { area: "FOH", role: "FOH Supervisor", venueIds: ["v1"] };
-const fohV2 = { area: "FOH", role: "FOH", venueIds: ["v2"] };
-const fohNoArea = { role: "FOH", venueIds: ["v1"] };
+const foh = {area: "FOH", role: "FOH", venueIds: ["v1"]};
+const boh = {area: "BOH", role: "BOH", venueIds: ["v1"]};
+const mgr = {area: "Mgmt", role: "Manager", venueIds: ["v1"]};
+const sup = {area: "FOH", role: "FOH Supervisor", venueIds: ["v1"]};
+const fohV2 = {area: "FOH", role: "FOH", venueIds: ["v2"]};
+const fohNoArea = {role: "FOH", venueIds: ["v1"]};
 
-const clFOHrole = { area: "FOH", autoAssign: { roles: ["FOH"] } };
-const clFOHroleLower = { area: "FOH", autoAssign: { roles: ["foh"] } };
-const clAllRoleFOH = { area: "All", autoAssign: { roles: ["FOH"] } };
-const clFOHnoRole = { area: "FOH" };
-const clBOHnoRole = { area: "BOH" };
-const mBOHrole = { cat: "BOH", autoAssign: { roles: ["BOH"] } };
+const clFOHrole = {area: "FOH", autoAssign: {roles: ["FOH"]}};
+const clFOHroleLower = {area: "FOH", autoAssign: {roles: ["foh"]}};
+const clAllRoleFOH = {area: "All", autoAssign: {roles: ["FOH"]}};
+const clFOHnoRole = {area: "FOH"};
+const clBOHnoRole = {area: "BOH"};
+const mBOHrole = {cat: "BOH", autoAssign: {roles: ["BOH"]}};
 
 // multi-area (areas[]) fixtures — the migration's target shape — kept identical in both repos
-const multiFB = { areas: ["FOH", "BOH"], role: "FOH", venueIds: ["v1"] };
-const cookMgmt = { areas: ["Mgmt"], role: "Cook", venueIds: ["v1"] };
-const cookBOH = { areas: ["BOH"], role: "Cook", venueIds: ["v1"] };
-const clFOHcook = { area: "FOH", autoAssign: { roles: ["Cook"] } };
-const mBOHfoh = { cat: "BOH", autoAssign: { roles: ["FOH"] } };
-const clKitchenFOH = { area: "Kitchen", autoAssign: { roles: ["FOH"] } };
+const multiFB = {areas: ["FOH", "BOH"], role: "FOH", venueIds: ["v1"]};
+const cookMgmt = {areas: ["Mgmt"], role: "Cook", venueIds: ["v1"]};
+const cookBOH = {areas: ["BOH"], role: "Cook", venueIds: ["v1"]};
+const clFOHcook = {area: "FOH", autoAssign: {roles: ["Cook"]}};
+const mBOHfoh = {cat: "BOH", autoAssign: {roles: ["FOH"]}};
+const clKitchenFOH = {area: "Kitchen", autoAssign: {roles: ["FOH"]}};
 
 // station HARD-gate (auto-assign) fixtures — kept identical in both repos
-const clFOHbar = { area: "FOH", stationId: "bar", autoAssign: { roles: ["FOH"] } };       // station-specific
-const clFOHnoStn = { area: "FOH", autoAssign: { roles: ["FOH"] } };                       // no station
-const clBarMgr = { area: "FOH", stationId: "bar", autoAssign: { roles: ["Manager"] } };   // station + manager role
-const clBarWrongRole = { area: "FOH", stationId: "bar", autoAssign: { roles: ["BOH"] } }; // station + a role the FOH-bar person lacks
-const clMultiStn = { area: "FOH", autoAssign: { roles: [], stations: ["bar", "counter"] } }; // multi-station auto-assign target
-const fohBar = { areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: ["bar"] };    // tagged the station
-const fohNoStn = { areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: [] };       // NOT tagged
-const mgrBar = { areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: ["bar"] };
-const mgrNoStn = { areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: [] };
+const clFOHbar = {area: "FOH", stationId: "bar", autoAssign: {roles: ["FOH"]}}; // station-specific
+const clFOHnoStn = {area: "FOH", autoAssign: {roles: ["FOH"]}}; // no station
+const clBarMgr = {area: "FOH", stationId: "bar", autoAssign: {roles: ["Manager"]}}; // station + manager role
+const clBarWrongRole = {area: "FOH", stationId: "bar", autoAssign: {roles: ["BOH"]}}; // station + a role the FOH-bar person lacks
+const clMultiStn = {area: "FOH", autoAssign: {roles: [], stations: ["bar", "counter"]}}; // multi-station auto-assign target
+const fohBar = {areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: ["bar"]}; // tagged the station
+const fohNoStn = {areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: []}; // NOT tagged
+const mgrBar = {areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: ["bar"]};
+const mgrNoStn = {areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: []};
 
 const CASES = [
   ["role+area match", clFOHrole, foh, "v1", true],
@@ -82,14 +82,14 @@ for (const [label, item, staff, venueId, expected] of CASES) {
 
 // same-people proof: server filter resolves to exactly the expected staff
 assert.deepStrictEqual(
-  [foh, boh, mgr, sup, fohV2, fohNoArea].filter((s) => shouldAutoAssign(clFOHrole, s, "v1")),
-  [foh, fohNoArea],
-  "FAILED: role-targeted FOH checklist should resolve to FOH line + unknown-area FOH"
+    [foh, boh, mgr, sup, fohV2, fohNoArea].filter((s) => shouldAutoAssign(clFOHrole, s, "v1")),
+    [foh, fohNoArea],
+    "FAILED: role-targeted FOH checklist should resolve to FOH line + unknown-area FOH",
 );
 assert.deepStrictEqual(
-  [foh, boh, mgr, sup, fohNoArea].filter((s) => shouldAutoAssign(clFOHnoRole, s, "v1")),
-  [mgr, sup],
-  "FAILED: no-roles checklist should resolve to managers/supervisors"
+    [foh, boh, mgr, sup, fohNoArea].filter((s) => shouldAutoAssign(clFOHnoRole, s, "v1")),
+    [mgr, sup],
+    "FAILED: no-roles checklist should resolve to managers/supervisors",
 );
 pass += 2;
 
@@ -120,11 +120,11 @@ const rosteredFromShift = (shift, venueId) => ({
   stationIds: shift.stationId ? [shift.stationId] : [],
 });
 // a BOH-home person rostered as FOH gets the FOH item, not the BOH item (home never read)
-const rosteredFOH = rosteredFromShift({ staffId: "x", role: "FOH", venueId: "v1", stationId: "" }, "v1");
+const rosteredFOH = rosteredFromShift({staffId: "x", role: "FOH", venueId: "v1", stationId: ""}, "v1");
 assert.strictEqual(rosteredFOH.area, "FOH", "FAILED: rostered FOH should derive area FOH");
 assert.strictEqual(shouldAutoAssign(clFOHrole, rosteredFOH, "v1"), true, "FAILED: rostered FOH → FOH checklist");
 assert.strictEqual(shouldAutoAssign(mBOHrole, rosteredFOH, "v1"), false, "FAILED: rostered FOH should NOT get BOH module");
-const rosteredBOH = rosteredFromShift({ staffId: "x", role: "BOH", venueId: "v1", stationId: "" }, "v1");
+const rosteredBOH = rosteredFromShift({staffId: "x", role: "BOH", venueId: "v1", stationId: ""}, "v1");
 assert.strictEqual(shouldAutoAssign(mBOHrole, rosteredBOH, "v1"), true, "FAILED: rostered BOH → BOH module");
 assert.strictEqual(shouldAutoAssign(clFOHrole, rosteredBOH, "v1"), false, "FAILED: rostered BOH should NOT get FOH checklist");
 pass += 5;
