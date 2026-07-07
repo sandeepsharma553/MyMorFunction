@@ -3166,8 +3166,19 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
   const stockPerm = hasExplicit
     ? (typeof emp.permissions.stock === "string" ? emp.permissions.stock : "none")
     : (roleDefaults[groupRole] || "none");
-  if (stockPerm !== "view" && stockPerm !== "edit") {
-    throw new HttpsError("permission-denied", "No stock access.");
+  // `pos` permission — POS order-taking is EVERY role's job by default (staff
+  // included: the POS PIN attributes each order), while the stock module stays
+  // manager+. Mirrors rgConfig DEFAULT_PERMISSIONS in both apps. An explicit
+  // permissions.pos revokes/grants per person; malformed explicit fails CLOSED.
+  const posDefaults = { owner: "edit", storeAdmin: "edit", manager: "edit", staff: "view" };
+  const hasExplicitPos = emp.permissions && !Array.isArray(emp.permissions) && Object.prototype.hasOwnProperty.call(emp.permissions, "pos");
+  const posPerm = hasExplicitPos
+    ? (typeof emp.permissions.pos === "string" ? emp.permissions.pos : "none")
+    : (posDefaults[groupRole] || "none");
+  const stockOk = stockPerm === "view" || stockPerm === "edit";
+  const posOk = posPerm === "view" || posPerm === "edit" || posPerm === "approve";
+  if (!stockOk && !posOk) {
+    throw new HttpsError("permission-denied", "No POS access.");
   }
   // Phase 0 / Fix 0.2 — per-venue authorisation. Owners/storeAdmins span every
   // venue in their group; managers/staff may only act on their assigned venue(s).
