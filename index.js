@@ -3476,6 +3476,12 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
       reference: ref,
       by: request.auth.uid, byName: actorName,
       staffId, staffName, // who TOOK the order (PIN-identified) — per-staff sales attribution
+      // deliberate admin sale — an owner/storeAdmin selling with NO staff record.
+      // Derived from the SERVER's own emp.groupRole (the auth block above), never
+      // from the payload: the client's orderMeta.soldByRole is deliberately ignored,
+      // so a tampered client cannot mark a staff sale as an owner sale. Omitted
+      // entirely on attributed sales and on legacy unattributed (non-admin) ones.
+      ...(staffId == null && isAdminTier ? { soldByRole: groupRole } : {}),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
