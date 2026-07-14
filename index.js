@@ -3334,7 +3334,9 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
     orderLines.push({
       menuItemId: mid, name: rm.displayName || mid, qty: lineQty,
       unitPrice: rgRound4(unitPrice), variantLabel, modifiers: mods,
-      notes: l.notes != null ? String(l.notes).slice(0, 200) : "",
+      // kitchen note — trimmed, capped, and OMITTED entirely when absent/empty
+      // (readers must use line.notes || ""; no empty strings written to order docs)
+      ...(l.notes != null && String(l.notes).trim() ? { notes: String(l.notes).trim().slice(0, 200) } : {}),
       course: l.course != null ? String(l.course).slice(0, 40) : "",
       gstApplicable: rm.gstApplicable !== false,
       lineTotal: rgRound4(lineQty * (unitPrice + modsDelta)),
