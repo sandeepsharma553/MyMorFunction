@@ -3378,6 +3378,15 @@ exports.rgSellOrder = onCall({ region: "us-central1" }, async (request) => {
   // Keep in sync with rgStockUtils.grossStockQty. Fallbacks (factor→1, yield→100)
   // make this identical to the old `deduct = qty × lineQty` on un-migrated data.
   for (const mv of moves) {
+    // Missing FIELDS on an existing doc = the intended fallback above (un-migrated
+    // data deducts at factor 1 / yield 100 by design). A missing DOC means a recipe
+    // references a deleted inventory item — same defaults apply (signal-and-proceed),
+    // but SURFACED like the other failure modes: the entry reaches the operator
+    // toast and the order's deductionSkips. Pushed per move, matching "No stock
+    // record" — the clients dedupe identical reasons.
+    if (!itemById[mv.itemId]) {
+      skipped.push({ menuItemId: mv.menuItemId, reason: `Inventory item ${mv.itemId} not found — deducted on default conversions` });
+    }
     const item = itemById[mv.itemId] || {};
     const stockToRecipe = Number(item.stockToRecipe) > 0 ? Number(item.stockToRecipe) : 1;
     const yieldPct = Number(item.yieldPercent) > 0 ? Number(item.yieldPercent) : 100;
