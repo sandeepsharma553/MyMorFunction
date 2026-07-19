@@ -39,15 +39,16 @@ function shouldAutoAssign(item, staff, venueId) {
   const seesAll = /manager|supervisor|in charge|owner|admin/i.test(staff.role || "");
   // staff areas as a LIST (backward-compat: fall back to the legacy single area)
   const sAreas = (Array.isArray(staff.areas) && staff.areas.length) ? staff.areas : (staff.area ? [staff.area] : []);
-  // Area (mirrors client moduleForStaff/checklistForStaff): universal "All", the item
-  // area is among the staff's areas, or seesAll. Unknown areas (empty) never block.
-  const itemArea = item.cat || item.area || "All";
+  // Area (mirrors client moduleForStaff/checklistForStaff): universal needs an EXPLICIT
+  // "All" — a missing cat/area is an oversight, NOT an implicit "everyone" (same ruling
+  // as checklistForStaff). Unknown STAFF areas (empty sAreas) still never block.
+  const itemArea = item.cat || item.area || "";
   const areaOk = seesAll || itemArea === "All" || !sAreas.length || sAreas.includes(itemArea);
   if (!areaOk) return false;
   // Station-DRIVEN (AUTO-ASSIGN ONLY — manual assign stays suggest-never-block): targets =
   // autoAssign.stations (multi-select) else the legacy single stationId. A station-targeted
   // item auto-assigns to staff tagged ANY of those stations (area already gated), REGARDLESS
-  // of role. Items with NO station targets fall through to role targeting. Byte-identical to client.
+  // of role. Items with NO station targets fall through to role targeting. Byte-identical across Admin/Ops/Functions.
   const stationTargets = (item.autoAssign && item.autoAssign.stations && item.autoAssign.stations.length) ? item.autoAssign.stations : (item.stationId ? [item.stationId] : []);
   if (stationTargets.length) return (Array.isArray(staff.stationIds) ? staff.stationIds : []).some((id) => stationTargets.includes(id));
   // Role targeting: when the item names roles, staff.role must be one (case-insensitive);

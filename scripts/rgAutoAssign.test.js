@@ -129,5 +129,14 @@ assert.strictEqual(shouldAutoAssign(mBOHrole, rosteredBOH, "v1"), true, "FAILED:
 assert.strictEqual(shouldAutoAssign(clFOHrole, rosteredBOH, "v1"), false, "FAILED: rostered BOH should NOT get FOH checklist");
 pass += 5;
 
+// ⚠ KEEP identical in all four parity test files (Admin ×2, Ops, Functions).
+// missing-area ruling — neither cat nor area is NOT an implicit "All":
+// an item with neither auto-assigns to nobody but see-all (authoring oversight).
+assert.strictEqual(shouldAutoAssign({}, {areas: ["FOH"], role: "FOH", venueIds: ["v1"]}, "v1"), false,
+    "FAILED: item with neither cat nor area must not auto-assign to a plain staffer");
+assert.strictEqual(shouldAutoAssign({}, {area: "FOH", role: "FOH Supervisor", venueIds: ["v1"]}, "v1"), true,
+    "FAILED: see-all staff still matches an area-less item");
+pass += 2;
+
 console.log(`✅ rgAutoAssign parity: ${pass}/${pass} cases pass (matches client truth table).`);
 process.exit(0);
