@@ -17,13 +17,15 @@
  *   venueId : the venue the item lives in
  * ════════════════════════════════════════════════════════════════════ */
 /* Derive an Area from a role string — used to give a SHIFT a rostered area (shift
- * docs carry a role + station but no area field). Mirrors the client's Phase-2
- * staffAreaBucket / ShiftPlanner roleArea regex (no "CK" — Central Kitchen is a venue,
- * and a "Central Kitchen" role contains "kitchen" → BOH). Unknown → "" so the
- * shouldAutoAssign "unknown area never blocks" escape applies. */
+ * docs carry a role + station but no area field). No "CK" — Central Kitchen is a venue,
+ * and a "Central Kitchen" role contains "kitchen" → BOH. MANAGERIAL roles return "":
+ * the legacy "Mgmt" token is gone, and shouldAutoAssign's seesAll regex is the SAME
+ * word list, so the area check is short-circuited for them either way (proven
+ * equivalent). Unknown → "" so the "unknown area never blocks" escape applies.
+ * Kept byte-identical to the client copies (Admin/Ops assignmentUtils.js). */
 function areaFromRole(role) {
   const r = role || "";
-  if (/manager|owner|admin|supervisor|in charge/i.test(r)) return "Mgmt";
+  if (/manager|owner|admin|supervisor|in charge/i.test(r)) return ""; // managerial — seesAll covers them; no baked-in token
   if (/foh|floor|\bbar\b|barista|counter|service/i.test(r)) return "FOH";
   if (/boh|kitchen|chef|grill|fry|wash|prep|cook|dish/i.test(r)) return "BOH";
   return "";
