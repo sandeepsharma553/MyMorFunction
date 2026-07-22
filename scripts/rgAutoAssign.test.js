@@ -102,7 +102,7 @@ const AREA_CASES = [
   ["BOH — Kitchen", "BOH"],
   ["Chef", "BOH"],
   ["Central Kitchen", "BOH"],
-  ["Store Manager", ""],  // managerial → "" (legacy "Mgmt" token removed; seesAll covers them)
+  ["Store Manager", ""], // managerial → "" (legacy "Mgmt" token removed; seesAll covers them)
   ["FOH Supervisor", ""], // managerial beats the FOH keyword — still "", never "FOH"
   ["Junior", ""],
   ["", ""],
