@@ -2886,6 +2886,36 @@ exports.rgOnShiftCreated = onDocumentWritten(
       stationIds: shift.stationId ? [shift.stationId] : [],
     };
 
+    // STATION FALLBACK (lazy, cached — at most ONE staff read per invocation): the
+    // planner's station field is OPTIONAL (defaults to ""), so a station-targeted
+    // checklist would match nobody whenever the shift carries no station. Only when that
+    // case is actually reached, read the staff member's PROFILE stationIds and match on
+    // those instead. The two sources deliberately differ: the SHIFT says what they are
+    // doing today (role/area/venue stay rostered); the PROFILE says what they are
+    // trained on. isAssignable mirrors rgOnStaffWritten's gate — the predicate itself
+    // never checks status, so the fallback must.
+    let profileStations = null; // null = not read yet; [] = read but none / unusable
+    const isAssignable = (s) => s && !["draft", "left", "inactive"].includes(String(s.status || "").toLowerCase());
+    const profileStationIds = async () => {
+      if (profileStations !== null) return profileStations;
+      try {
+        const sSnap = await db.collection("restaurantGroups").doc(groupId).collection("staff").doc(shift.staffId).get();
+        const sd = sSnap.exists ? sSnap.data() : null;
+        if (sd && isAssignable(sd)) {
+          profileStations = Array.isArray(sd.stationIds) ? sd.stationIds : [];
+          console.log(`[rgOnShiftCreated] station fallback: shift has no station — using ${profileStations.length} profile station(s) for ${groupId}/${shift.staffId}`);
+        } else {
+          profileStations = [];
+          console.log(`[rgOnShiftCreated] station fallback: staff doc ${sSnap.exists ? "not assignable" : "missing"} for ${groupId}/${shift.staffId} — matching no stations`);
+        }
+      } catch (e) {
+        profileStations = []; // a failed read must never throw out of the handler
+        console.log(`[rgOnShiftCreated] station fallback read failed for ${groupId}/${shift.staffId}: ${e.message || String(e)} — matching no stations`);
+      }
+      return profileStations;
+    };
+    let loggedShiftStationPath = false; // log the shift's-own-station path once per invocation too
+
     // shift-created notification (idempotent enough — trigger fires once per doc)
     await rgNotify(groupId, {
       to: shift.staffId,
@@ -2980,16 +3010,33 @@ exports.rgOnShiftCreated = onDocumentWritten(
         }
         const auto = c.autoAssign || {};
         const roles = auto.roles || [];
-        // shift-triggered assignment is only for role-targeted checklists (no-roles
-        // checklists are scheduler/owner territory) — preserved guard.
-        if (!roles.length) continue;
+        const stationTargeted = !!((auto.stations && auto.stations.length) || c.stationId);
+        // shift-triggered assignment is for ROLE-targeted checklists (today's path) and
+        // for DAILY STATION-targeted ones — previously owned by NOBODY: the scheduler and
+        // the staff trigger both skip daily, and no editor writes autoAssign.roles. Items
+        // with neither still assign to nobody (the committed untargeted ruling).
+        if (!roles.length && !stationTargeted) continue;
         if (auto.shiftStart && auto.shiftStart !== shift.start) continue;
         if ((c.frequency || "daily") !== "daily") continue; // weekly/monthly handled by the scheduler
         // respect the checklist's "Runs on" weekdays — don't assign an opening list on a day it doesn't run
         const shiftWeekday = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][shift.day];
         if (Array.isArray(c.days) && c.days.length && shiftWeekday && !c.days.includes(shiftWeekday)) continue;
-        // Area→Role gate on the ROSTERED identity (rostered role + derived area).
-        if (!shouldAutoAssign(c, rostered, venueId)) continue;
+        // Match identity: role/area/venue ALWAYS from the shift's rostered identity (what
+        // they are doing today); stationIds from the shift when it names a station, else
+        // the profile fallback (what they are trained on) — see profileStationIds above.
+        let matchIdentity = rostered;
+        if (stationTargeted) {
+          if (shift.stationId) {
+            if (!loggedShiftStationPath) {
+              console.log(`[rgOnShiftCreated] station match via the shift's own station "${shift.stationId}" ${groupId}/${venueId}/${shiftId}`);
+              loggedShiftStationPath = true;
+            }
+          } else {
+            matchIdentity = { ...rostered, stationIds: await profileStationIds() };
+          }
+        }
+        // Area→Station/Role gate on that identity.
+        if (!shouldAutoAssign(c, matchIdentity, venueId)) continue;
         // person-aware id — a reassignment can't collide with the previous holder's doc
         // (the old auto-{cid}-{shiftId} scheme was shift-keyed, so the new person was
         // silently skipped and the old holder kept a stale assignment).
