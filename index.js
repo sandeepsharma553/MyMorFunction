@@ -1,7 +1,7 @@
 /* eslint-disable */
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
-const { onDocumentUpdated, onDocumentCreated } = require("firebase-functions/v2/firestore");
+const { onDocumentUpdated, onDocumentCreated, onDocumentWritten } = require("firebase-functions/v2/firestore");
 const { getFirestore } = require("firebase-admin/firestore");
 const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
@@ -3044,6 +3044,146 @@ exports.rgRecurringChecklists = onSchedule(
         console.error("[rgRecurringChecklists]", g.id, e.message || String(e));
       }
     }
+    return null;
+  }
+);
+
+// ── Staff-triggered auto-assign (ADDITIVE ONLY) ── fires on hire, on a stationIds
+// change, or on a transition INTO an assignable state (e.g. Inactive→Active). NEVER
+// revokes — going inactive simply stops future work. Idempotent across EVERY path
+// (client random-id assigns, shift auto-, scheduler rec-, prior runs): the skip
+// decision is a staffId+itemId field query on the target collection, not just a
+// deterministic-id check; what IS written still uses staff-{itemId}-{staffId} ids so
+// re-runs stay idempotent. SCOPE: all training/SOP modules, but ONLY non-recurring
+// checklists — slot-linked (shiftLinks) belong to the shift-slot mechanism, and
+// daily/weekly/fortnightly/monthly belong to the shift trigger / scheduler (no bonus
+// undated copy beside their dated ones). Notifies ONCE per staff member per run — a
+// single rgNotify summary after the scan, only when something was actually written
+// (rgNotify swallows its own errors, so notify can never abort the handler; assignments
+// never depend on notify). The scan gate keeps phone/name-only edits free. Deletions do
+// nothing. Never throws (a retry would re-run the scan).
+exports.rgOnStaffWritten = onDocumentWritten(
+  {
+    document: "restaurantGroups/{groupId}/staff/{staffId}",
+    database: "mymor-australia",
+    region: "us-central1",
+  },
+  async (event) => {
+    const { groupId, staffId } = event.params;
+    // TEMPORARY — remove before enabling for the live group.
+    // The trigger is bound to a {groupId} wildcard, so a deploy activates it for EVERY
+    // group at once. This guard confines it to the test group while the behaviour is
+    // click-tested. Delete this block (and redeploy) to enable it group-wide.
+    const RG_STAFF_TRIGGER_GROUPS = ["YQRkUwBO5wMIdLSgcpji"];
+    if (!RG_STAFF_TRIGGER_GROUPS.includes(groupId)) return;
+    const before = event.data.before.exists ? event.data.before.data() : null;
+    const after = event.data.after.exists ? event.data.after.data() : null;
+    if (!after) return null; // deletion — never act
+    // assignable = not a draft, not departed, not inactive
+    const isAssignable = (s) => s && !["draft", "left", "inactive"].includes(String(s.status || "").toLowerCase());
+    if (!isAssignable(after)) return null;
+    // decide whether to scan — the reasons are exhaustive; anything else is a no-op edit
+    const sortedIds = (s) => JSON.stringify([...((s && s.stationIds) || [])].sort());
+    const reason = !before ? "new-hire"
+      : (!isAssignable(before) && isAssignable(after)) ? "became-assignable"
+        : (sortedIds(before) !== sortedIds(after)) ? "stations-changed"
+          : null;
+    if (!reason) return null;
+    console.log(`[rgOnStaffWritten] ${groupId}/${staffId} scan: ${reason}`);
+    const staff = { id: staffId, ...after };
+    const vids = Array.isArray(after.venueIds) ? after.venueIds : [];
+    let trainingCreated = 0; // written this run (dup-query skips don't count)
+    let checklistCreated = 0;
+    let venuesScanned = 0;
+    for (const vid of vids) {
+      try {
+        venuesScanned++;
+        const venueRef = db.collection("restaurantGroups").doc(groupId).collection("venues").doc(vid);
+        // training + SOP (same collection, sop flag) — mirrors rgOnShiftCreated's write shape
+        const tmSnap = await venueRef.collection("trainingModules").get();
+        for (const d of tmSnap.docs) {
+          const m = d.data();
+          if (!shouldAutoAssign(m, staff, vid)) continue;
+          // idempotent across ALL paths: any existing assignment for this staff+module —
+          // client (random addDoc id), shift (auto-…), or a prior run — means skip.
+          const dup = await venueRef.collection("trainingAssignments")
+            .where("staffId", "==", staffId).where("moduleId", "==", d.id).limit(1).get();
+          if (!dup.empty) continue;
+          const aRef = venueRef.collection("trainingAssignments").doc(`staff-${d.id}-${staffId}`);
+          await aRef.set({
+            staffId,
+            staffName: after.displayName || after.name || "",
+            venue: m.venue || "",
+            venueId: vid,
+            moduleId: d.id,
+            moduleTitle: m.title || "",
+            due: "",
+            priority: "normal",
+            notes: "",
+            ...rgSnapshotForAssign(m),
+            status: "Not started",
+            progress: 0,
+            auto: true,
+            source: "staff-trigger",
+            createdAt: RG_FIELD.serverTimestamp(),
+          });
+          trainingCreated++;
+        }
+        // checklists — ONLY non-recurring one-offs. Slot-linked (shiftLinks) belong to
+        // the shift-slot mechanism; recurring checklists are owned by the shift trigger
+        // (daily) / scheduler (weekly, monthly) — the staff trigger must not write a
+        // lone undated copy beside their dated ones. Fortnightly currently has no
+        // scheduler branch, so it is intentionally unsupported here rather than
+        // half-assigned via this path.
+        const clSnap = await venueRef.collection("checklists").get();
+        for (const d of clSnap.docs) {
+          const c = d.data();
+          if (Array.isArray(c.shiftLinks) && c.shiftLinks.length) continue;
+          if (["daily", "weekly", "fortnightly", "monthly"].includes(String(c.frequency || "").toLowerCase())) continue;
+          if (!shouldAutoAssign(c, staff, vid)) continue;
+          // idempotent across ALL paths — same field-query rule as training.
+          const dup = await venueRef.collection("checklistAssignments")
+            .where("staffId", "==", staffId).where("checklistId", "==", d.id).limit(1).get();
+          if (!dup.empty) continue;
+          const aRef = venueRef.collection("checklistAssignments").doc(`staff-${d.id}-${staffId}`);
+          await aRef.set({
+            staffId,
+            staffName: after.displayName || after.name || "",
+            venueId: vid,
+            venue: c.venue || "",
+            checklistId: d.id,
+            checklistTitle: c.title || "",
+            ...rgSnapshotForChecklist(c),
+            status: "Not started",
+            progress: 0,
+            auto: true,
+            source: "staff-trigger",
+            createdAt: RG_FIELD.serverTimestamp(),
+          });
+          checklistCreated++;
+        }
+      } catch (e) {
+        console.error("[rgOnStaffWritten]", groupId, staffId, vid, e.message || String(e));
+      }
+    }
+    // ONE summary notification per staff member per run — only when something was
+    // actually written; a zero-half is omitted from the body. Bare await: rgNotify
+    // catches internally, so this can never throw out of the handler.
+    const created = trainingCreated + checklistCreated;
+    if (created) {
+      const parts = [];
+      if (trainingCreated) parts.push(`${trainingCreated} training item${trainingCreated === 1 ? "" : "s"}`);
+      if (checklistCreated) parts.push(`${checklistCreated} checklist${checklistCreated === 1 ? "" : "s"}`);
+      await rgNotify(groupId, {
+        to: staffId,
+        type: trainingCreated ? "training" : "checklist", // house types from the shift trigger
+        title: "New items assigned",
+        body: `${parts.join(" and ")} assigned to you`,
+        venueId: vids[0] || "",
+        by: "Auto-assign",
+      });
+    }
+    console.log(`[rgOnStaffWritten] ${groupId}/${staffId} done: reason=${reason} venues=${venuesScanned} training=${trainingCreated} checklists=${checklistCreated}`);
     return null;
   }
 );
