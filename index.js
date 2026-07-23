@@ -3137,8 +3137,38 @@ exports.rgOnShiftCreated = onDocumentWritten(
   }
 );
 
-// Daily 03:00 Sydney: materialize weekly/monthly recurring checklists for staff
-// whose role matches, with deterministic ids so re-runs never duplicate.
+// Fortnight parity for the scheduler. Returns true (this is the anchor's fortnight),
+// false (the off week), or null (anchor missing/invalid — caller logs and skips).
+//
+// DATE HAZARD / DST REASONING: the scheduler's `now` is built via toLocaleString(Sydney)
+// then read with LOCAL getters — a wall-clock hybrid. A bare new Date("YYYY-MM-DD") is
+// UTC midnight, a DIFFERENT basis: differencing the two drifts 10-11 hours and flips
+// week parity across DST boundaries. So the anchor is parsed by PARTS into a local
+// construction (same basis as `now`), BOTH dates are reduced to their week's Monday at
+// local midnight ((getDay()+6)%7 — the codebase's Monday convention), and whole weeks
+// are counted with Math.round, NOT floor: in a DST-observing runtime a Monday-to-Monday
+// interval spanning a transition is 167 or 169 hours (6.96/7.04 days) and floor would
+// misread it; round always lands on the integer. (On the UTC Functions runtime there is
+// no DST at all and the interval is exactly 7 days — round is then a no-op.)
+// Parity is symmetric around the anchor: a FUTURE anchor also fires on same-parity
+// weeks before its date — the anchor selects WHICH fortnight, it is not a start date.
+function rgFortnightDue(anchorStr, now) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(anchorStr || "")) return null;
+  const [y, m, d] = anchorStr.split("-").map(Number);
+  const anchor = new Date(y, m - 1, d);
+  // reject rollovers like 2026-02-31 (Date silently becomes March 3rd)
+  if (anchor.getFullYear() !== y || anchor.getMonth() !== m - 1 || anchor.getDate() !== d) return null;
+  const mondayOf = (dt) => {
+    const x = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()); // local midnight
+    x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+    return x;
+  };
+  const weeks = Math.round((mondayOf(now) - mondayOf(anchor)) / (7 * 24 * 60 * 60 * 1000));
+  return weeks % 2 === 0;
+}
+
+// Daily 03:00 Sydney: materialize weekly/fortnightly/monthly recurring checklists for
+// staff whose role matches, with deterministic ids so re-runs never duplicate.
 exports.rgRecurringChecklists = onSchedule(
   { schedule: "0 3 * * *", timeZone: "Australia/Sydney", region: "us-central1" },
   async () => {
@@ -3161,8 +3191,21 @@ exports.rgRecurringChecklists = onSchedule(
             if (Array.isArray(c.shiftLinks) && c.shiftLinks.length) continue;
             const freq = c.frequency || "daily";
             if (freq === "daily") continue;
+            // fortnightly needs a valid anchor — the anchor picks WHICH fortnight,
+            // scheduleDay picks which day (exactly as it does for weekly). No anchor →
+            // cannot be scheduled; never fall back to createdAt (that would silently
+            // pick a cadence nobody chose).
+            let fortnightEven = null;
+            if (freq === "fortnightly") {
+              fortnightEven = rgFortnightDue(c.anchorDate, now);
+              if (fortnightEven === null) {
+                console.log(`[rgRecurringChecklists] fortnightly checklist has no valid anchor date ${g.id}/${v.id}/${d.id} "${c.title || ""}" — cannot be scheduled; set an anchor in the editor`);
+                continue;
+              }
+            }
             const due =
               (freq === "weekly" && (c.scheduleDay || "mon") === weekday) ||
+              (freq === "fortnightly" && (c.scheduleDay || "mon") === weekday && fortnightEven) ||
               (freq === "monthly" && Number(c.scheduleDate || 1) === dayOfMonth);
             if (!due) continue;
             // Who gets this recurring checklist — via the SAME Area→Role predicate the
