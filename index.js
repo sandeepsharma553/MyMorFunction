@@ -2840,19 +2840,47 @@ async function rgNotify(groupId, payload) {
   }
 }
 
-// When a shift is created: auto-assign role-linked checklists (per shift) and
-// training modules (once per person), then notify the staff member.
-exports.rgOnShiftCreated = onDocumentCreated(
+// When a shift is WRITTEN (created OR edited): auto-assign role-linked checklists
+// (per shift) and training modules (once per person), then notify the staff member.
+// NOTE: the export keeps its historical name rgOnShiftCreated even though it now
+// covers writes — renaming would orphan the deployed function and leave the old
+// one live alongside the new.
+exports.rgOnShiftCreated = onDocumentWritten(
   {
     document: "restaurantGroups/{groupId}/venues/{venueId}/shifts/{shiftId}",
     database: "mymor-australia",
     region: "us-central1",
   },
   async (event) => {
-    const shift = event.data && event.data.data();
-    if (!shift || !shift.staffId) return null;
     const { groupId, venueId, shiftId } = event.params;
+    // TEMPORARY — remove before enabling for the live group.
+    // The trigger is bound to a {groupId} wildcard, so a deploy activates it for EVERY
+    // group at once. This guard confines it to the test group while the behaviour is
+    // click-tested — and it deliberately makes the function INERT for all other groups,
+    // INCLUDING the existing role-gated checklist and training blocks below, which ran
+    // group-wide before this conversion. Delete this block (and redeploy) to restore
+    // them and enable the write-trigger group-wide.
+    const RG_SHIFT_TRIGGER_GROUPS = ["YQRkUwBO5wMIdLSgcpji"];
+    if (!RG_SHIFT_TRIGGER_GROUPS.includes(groupId)) return;
+    const before = event.data.before.exists ? event.data.before.data() : null;
+    const after = event.data.after.exists ? event.data.after.data() : null;
+    if (!after) return; // deletion — not handled (unchanged from today)
+    // DELTA GATE: shifts are written on every clock-in, break start/end, clock-out and
+    // break-override tweak (ShiftPlannerPage.js:142/:157/:168) — without this gate the
+    // handler would re-read the venue's checklists on every punch tap.
+    if (before) {
+      const same = before.staffId === after.staffId
+        && before.day === after.day
+        && before.start === after.start;
+      if (same) return; // punch/break/notes/role edits never affect assignment
+    }
+    const shift = after; // (was: event.data.data() under onDocumentCreated)
+    if (!shift.staffId) return null;
     const venueRef = db.collection("restaurantGroups").doc(groupId).collection("venues").doc(venueId);
+    // Slot-day convention ported from the client (checklistShiftUtils.js:7):
+    // shift.day is a 0–6 index, Mon=0; slot links store the SAME 3-letter day names.
+    const SLOT_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const dayName = SLOT_DAYS[shift.day] || "";
 
     // Auto-assign off the ROSTERED identity for THIS shift — the role (and the area
     // derived from it) the person is actually working — NOT their home profile. Staff
@@ -2877,13 +2905,87 @@ exports.rgOnShiftCreated = onDocumentCreated(
     });
 
     try {
-      // 1) checklists auto-linked to this role (and optionally this start time)
+      // 1) checklists — slot-linked ones assign via the SLOT BRANCH below (ported from
+      //    the Admin client's checklistShiftUtils.js, which is being retired); the
+      //    role-targeted gate keeps handling the rest.
+      const aCol = venueRef.collection("checklistAssignments");
+      const slotBatch = db.batch(); // ONE batch for hand-overs + writes, like the client's writeBatch
+      let slotOps = 0;
+      const slotCreatedTitles = [];
+      const slotErrors = []; // per-checklist failures (client parity) — logged, never thrown
       const clSnap = await venueRef.collection("checklists").get();
       for (const d of clSnap.docs) {
         const c = d.data();
-        // slot-linked checklists are assigned client-side by the shift-slot mechanism
-        // (checklistShiftUtils.js) — skip role-matching so a shift never double-assigns.
-        if (Array.isArray(c.shiftLinks) && c.shiftLinks.length) continue;
+        if (Array.isArray(c.shiftLinks) && c.shiftLinks.length) {
+          // ── SLOT BRANCH ── a slot-owned checklist never takes the role path. Only a
+          // slot matching THIS shift's day+start participates; a slot-linked checklist
+          // whose slots don't match is skipped entirely (neither branch). Each
+          // checklist's work runs in its own try/catch (client parity —
+          // checklistShiftUtils.js:47/:96-98) so one failure skips itself, not the rest.
+          try {
+            if (!c.shiftLinks.some((l) => l.day === dayName && l.start === shift.start)) continue;
+            // weekKey MUST be the shift doc's STORED key — the deliberately frozen
+            // UTC-shifted weekKeyOf format every writer stamps. NEVER recompute it
+            // server-side: a locally-derived key would match no stored assignment and the
+            // once-per-week guarantee would fail silently. Missing → skip and log.
+            if (!shift.weekKey) { console.log(`[rgOnShiftCreated] slot skip (no weekKey) ${groupId}/${venueId}/${shiftId} checklist=${d.id}`); continue; }
+            // recurring:false → one assignment per person per checklist, EVER (any week)
+            if (c.recurring === false) {
+              const prev = await aCol.where("checklistId", "==", d.id).where("staffId", "==", shift.staffId).limit(1).get();
+              if (!prev.empty) continue;
+            }
+            // everything already written for this checklist + week (idempotency + staff-change).
+            // Matches on FIELDS (checklistId/weekKey, then triggeredBy/day/shiftStart in
+            // memory), never on doc ids — so legacy client-written slot-{cid}-{shiftId}
+            // docs are still found by the short-circuit and the hand-over below.
+            const wkSnap = await aCol.where("checklistId", "==", d.id).where("weekKey", "==", shift.weekKey).get();
+            const slotDocs = wkSnap.docs.filter((x) => {
+              const a = x.data();
+              return a.triggeredBy === "shift" && a.day === dayName && a.shiftStart === shift.start;
+            });
+            // already assigned to this person for this slot+week → nothing to do
+            if (slotDocs.some((x) => x.data().staffId === shift.staffId && x.data().status !== "Unassigned")) continue;
+            // the slot changed hands → mark the previous person's assignment Unassigned (not deleted)
+            slotDocs
+              .filter((x) => x.data().staffId !== shift.staffId && x.data().status !== "Unassigned")
+              .forEach((x) => {
+                slotBatch.update(x.ref, { status: "Unassigned", unassignedReason: "Shift reassigned" });
+                slotOps++;
+              });
+            // canonical assignment shape + slot-tracing fields (client parity, field for
+            // field). PERSON-AWARE id — a deliberate divergence from the retiring client
+            // mechanism (checklistShiftUtils.js): its shift-keyed slot-{cid}-{shiftId} made
+            // an IN-PLACE reassignment aim the hand-over update AND the new write at the
+            // SAME document — the old holder's record was silently overwritten (or the
+            // batch threw). Person-aware ids make them distinct docs: the old holder is
+            // marked Unassigned, the new holder gets their own, one batch, no collision.
+            // Re-saves stay idempotent via the same-person short-circuit above.
+            slotBatch.set(aCol.doc(`slot-${d.id}-${shiftId}-${shift.staffId}`), {
+              staffId: shift.staffId,
+              staffName: shift.staffName || "",
+              venueId,
+              venue: shift.venue || "",
+              checklistId: d.id,
+              checklistTitle: c.title || "",
+              ...rgSnapshotForChecklist(c),
+              status: "Not started",
+              progress: 0,
+              weekKey: shift.weekKey,
+              day: dayName,
+              shiftStart: shift.start || "",
+              shiftId,
+              triggeredBy: "shift",
+              recurring: c.recurring !== false,
+              assignedAt: RG_FIELD.serverTimestamp(),
+              createdAt: RG_FIELD.serverTimestamp(),
+            });
+            slotOps++;
+            slotCreatedTitles.push(c.title || "Checklist");
+          } catch (e) {
+            slotErrors.push(`${c.title || d.id}: ${e.message || String(e)}`);
+          }
+          continue; // slot-owned — never falls through to the role gate
+        }
         const auto = c.autoAssign || {};
         const roles = auto.roles || [];
         // shift-triggered assignment is only for role-targeted checklists (no-roles
@@ -2896,9 +2998,22 @@ exports.rgOnShiftCreated = onDocumentCreated(
         if (Array.isArray(c.days) && c.days.length && shiftWeekday && !c.days.includes(shiftWeekday)) continue;
         // Area→Role gate on the ROSTERED identity (rostered role + derived area).
         if (!shouldAutoAssign(c, rostered, venueId)) continue;
-        const aId = `auto-${d.id}-${shiftId}`; // deterministic → idempotent per shift
-        const aRef = venueRef.collection("checklistAssignments").doc(aId);
-        if ((await aRef.get()).exists) continue;
+        // person-aware id — a reassignment can't collide with the previous holder's doc
+        // (the old auto-{cid}-{shiftId} scheme was shift-keyed, so the new person was
+        // silently skipped and the old holder kept a stale assignment).
+        const aId = `auto-${d.id}-${shiftId}-${shift.staffId}`;
+        const aRef = aCol.doc(aId);
+        if ((await aRef.get()).exists) continue; // same-shift re-save
+        // hand-over: any OTHER person's doc for this checklist+shift — including legacy
+        // shift-keyed auto-{cid}-{shiftId} docs — is marked Unassigned, same values as
+        // the slot branch. The assignment follows the shift.
+        const prior = await aCol.where("checklistId", "==", d.id).where("shiftId", "==", shiftId).get();
+        for (const x of prior.docs) {
+          const a = x.data();
+          if (a.staffId !== shift.staffId && a.status !== "Unassigned") {
+            await x.ref.update({ status: "Unassigned", unassignedReason: "Shift reassigned" });
+          }
+        }
         await aRef.set({
           staffId: shift.staffId,
           staffName: shift.staffName || "",
@@ -2921,6 +3036,23 @@ exports.rgOnShiftCreated = onDocumentCreated(
           venueId,
           by: "Auto-assign",
         });
+      }
+      // commit the slot mechanism's hand-overs + writes together (all-or-nothing, the
+      // client's single-writeBatch behaviour), then its single summary notification —
+      // "Checklist for your shift" listing the created titles, by "Shift link".
+      if (slotErrors.length) console.error(`[rgOnShiftCreated] slot errors ${groupId}/${venueId}/${shiftId}: ${slotErrors.join(" | ")}`);
+      if (slotOps) {
+        await slotBatch.commit();
+        if (slotCreatedTitles.length) {
+          await rgNotify(groupId, {
+            to: shift.staffId,
+            type: "checklist",
+            title: "Checklist for your shift",
+            body: `${slotCreatedTitles.join(", ")} — ${dayName} ${shift.start} at ${shift.venue || "your venue"}`,
+            venueId,
+            by: "Shift link",
+          });
+        }
       }
 
       // 2) training modules auto-linked to this role (assigned once per person)
