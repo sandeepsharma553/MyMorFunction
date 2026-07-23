@@ -42,6 +42,11 @@ const fohNoStn = {areas: ["FOH"], role: "FOH", venueIds: ["v1"], stationIds: []}
 const mgrBar = {areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: ["bar"]};
 const mgrNoStn = {areas: ["Mgmt"], role: "Manager", venueIds: ["v1"], stationIds: []};
 
+// untargeted-rule fixtures (no stations + no roles → NOBODY; only TARGETED paths reach managers)
+const clAllMgrRole = {area: "All", autoAssign: {roles: ["Manager"]}}; // manager NAMED in roles
+const mBOHmgrRole = {cat: "BOH", autoAssign: {roles: ["Manager"]}}; // role-targeted CROSS-AREA item (mgr area is Mgmt)
+const clLiveShape = {area: "FOH", autoAssign: {roles: [], shiftStart: "", stations: []}}; // the editors' explicit-empty shape
+
 const CASES = [
   ["role+area match", clFOHrole, foh, "v1", true],
   ["area+role mismatch", clFOHrole, boh, "v1", false],
@@ -50,11 +55,11 @@ const CASES = [
   ["All area, role match", clAllRoleFOH, foh, "v1", true],
   ["All area, role mismatch", clAllRoleFOH, boh, "v1", false],
   ["no-roles item NOT auto-assigned to line staff", clFOHnoRole, foh, "v1", false],
-  ["no-roles item goes to managers", clFOHnoRole, mgr, "v1", true],
+  ["untargeted item (no stations, no roles) assigns NOBODY — not even managers", clFOHnoRole, mgr, "v1", false],
   ["wrong venue excluded", clFOHrole, fohV2, "v1", false],
   ["unknown staff.area never blocks", clFOHrole, fohNoArea, "v1", true],
   ["role match is case-insensitive", clFOHroleLower, foh, "v1", true],
-  ["supervisor (sees all) gets no-roles cross-area item", clBOHnoRole, sup, "v1", true],
+  ["untargeted cross-area item assigns NOBODY — supervisors included", clBOHnoRole, sup, "v1", false],
   // multi-area (areas[]) + dropped area-based see-all
   ["multi-area person gets a FOH item", clFOHrole, multiFB, "v1", true],
   ["multi-area person ALSO gets a BOH item", mBOHfoh, multiFB, "v1", true],
@@ -72,6 +77,13 @@ const CASES = [
   // multi-station auto-assign (autoAssign.stations): staff tagged ANY target station is assigned
   ["multi-station item → staff at one of the target stations assigned", clMultiStn, fohBar, "v1", true],
   ["multi-station item → staff at none of the target stations excluded", clMultiStn, fohNoStn, "v1", false],
+  // untargeted rule: no stations + no roles → NOBODY. Managers keep every TARGETED path
+  // (named role, station tag — see also "manager WITH the station" above); only the
+  // untargeted fallthrough is gone.
+  ["manager still assigned when NAMED in autoAssign.roles", clAllMgrRole, mgr, "v1", true],
+  ["roles:[] station-targeted item still assigns the manager via the station tag", clMultiStn, mgrBar, "v1", true],
+  ["seesAll still bypasses the AREA gate for a role-targeted cross-area item", mBOHmgrRole, mgr, "v1", true],
+  ["live shape — explicit roles:[] AND stations:[] assigns NOBODY, managers included", clLiveShape, mgr, "v1", false],
 ];
 
 let pass = 0;
@@ -88,8 +100,8 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(
     [foh, boh, mgr, sup, fohNoArea].filter((s) => shouldAutoAssign(clFOHnoRole, s, "v1")),
-    [mgr, sup],
-    "FAILED: no-roles checklist should resolve to managers/supervisors",
+    [], // was [mgr, sup] before the untargeted-→-nobody change
+    "FAILED: untargeted (no-roles) checklist must resolve to NOBODY — managers included",
 );
 pass += 2;
 
@@ -131,11 +143,12 @@ pass += 5;
 
 // ⚠ KEEP identical in all four parity test files (Admin ×2, Ops, Functions).
 // missing-area ruling — neither cat nor area is NOT an implicit "All":
-// an item with neither auto-assigns to nobody but see-all (authoring oversight).
+// an item with neither auto-assigns to NOBODY — see-all included (was true pre-change:
+// see-all no longer rescues an untargeted item with no stations and no roles).
 assert.strictEqual(shouldAutoAssign({}, {areas: ["FOH"], role: "FOH", venueIds: ["v1"]}, "v1"), false,
     "FAILED: item with neither cat nor area must not auto-assign to a plain staffer");
-assert.strictEqual(shouldAutoAssign({}, {area: "FOH", role: "FOH Supervisor", venueIds: ["v1"]}, "v1"), true,
-    "FAILED: see-all staff still matches an area-less item");
+assert.strictEqual(shouldAutoAssign({}, {area: "FOH", role: "FOH Supervisor", venueIds: ["v1"]}, "v1"), false,
+    "FAILED: see-all staff must NOT match an untargeted area-less item (untargeted → nobody)");
 pass += 2;
 
 console.log(`✅ rgAutoAssign parity: ${pass}/${pass} cases pass (matches client truth table).`);

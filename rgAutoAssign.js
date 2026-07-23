@@ -7,9 +7,12 @@
  * server auto-assign (rgOnShiftCreated / rgRecurringChecklists) and client suggest
  * never disagree about who an item is for.
  *
- * Station is a ranking nudge only (client matchScore) — never a hard yes/no gate —
- * so it does NOT appear here. Area is the client matcher; roles refine; managers
- * ("sees all") are eligible for everything. An unset staff.area never blocks
+ * Station targets ARE a hard gate here: when an item names stations, only staff tagged
+ * one of them match, and the check returns before roles are considered (the "ranking
+ * nudge" is matchScore/isSuggested — the suggest-ordering layer — not this predicate).
+ * Area is the client matcher; roles refine; managers
+ * ("sees all") bypass only the AREA gate — eligibility still needs a station or role
+ * target on the item (untargeted items match nobody). An unset staff.area never blocks
  * (additive/guarded: we only exclude on a KNOWN area mismatch).
  *
  *   item    : checklist ({area}) or training module ({cat}); may carry autoAssign.roles
@@ -53,14 +56,15 @@ function shouldAutoAssign(item, staff, venueId) {
   // of role. Items with NO station targets fall through to role targeting. Byte-identical across Admin/Ops/Functions.
   const stationTargets = (item.autoAssign && item.autoAssign.stations && item.autoAssign.stations.length) ? item.autoAssign.stations : (item.stationId ? [item.stationId] : []);
   if (stationTargets.length) return (Array.isArray(staff.stationIds) ? staff.stationIds : []).some((id) => stationTargets.includes(id));
-  // Role targeting: when the item names roles, staff.role must be one (case-insensitive);
-  // when it names none, only seesAll staff are auto-targeted (recurring default = managers).
+  // Role targeting: when the item names roles, staff.role must be one (case-insensitive).
+  // When it names NONE (and no station targets matched above), the item auto-assigns to
+  // NOBODY — seesAll included. It previously fell through to managers, which contradicted
+  // both editors' helper text ("otherwise assign it manually") and silently delivered
+  // untargeted checklists to managers nobody had assigned them to. Manual assign, slot
+  // links and station/role targeting are unaffected.
   const roles = (item.autoAssign && item.autoAssign.roles) || [];
-  if (roles.length) {
-    if (!(staff.role && roles.some((r) => r && r.toLowerCase() === staff.role.toLowerCase()))) return false;
-  } else if (!seesAll) {
-    return false;
-  }
+  if (!roles.length) return false;
+  if (!(staff.role && roles.some((r) => r && r.toLowerCase() === staff.role.toLowerCase()))) return false;
   return true;
 }
 

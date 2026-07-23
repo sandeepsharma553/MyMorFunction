@@ -3127,11 +3127,14 @@ exports.rgRecurringChecklists = onSchedule(
               (freq === "monthly" && Number(c.scheduleDate || 1) === dayOfMonth);
             if (!due) continue;
             // Who gets this recurring checklist — via the SAME Area→Role predicate the
-            // client uses (venue + area + role-targeting, managers when no roles named).
-            // Area gating is NEW; venue/role/manager-fallback behaviour is preserved.
+            // client uses (venue + area + station/role targeting; an item with no
+            // stations and no roles matches NOBODY — the manager fallback is gone).
             const targets = staff.filter(
               (s) => (s.status || "Active") === "Active" && shouldAutoAssign(c, s, v.id)
             );
+            if (!targets.length) {
+              console.log(`[rgRecurringChecklists] due checklist matched NOBODY ${g.id}/${v.id}/${d.id} "${c.title || ""}" — no station or role targets (untargeted items auto-assign to nobody)`);
+            }
             for (const s of targets) {
               const aId = `rec-${d.id}-${s.id}-${dateKey}`;
               const aRef = v.ref.collection("checklistAssignments").doc(aId);
