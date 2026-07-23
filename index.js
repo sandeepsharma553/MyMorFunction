@@ -2853,15 +2853,7 @@ exports.rgOnShiftCreated = onDocumentWritten(
   },
   async (event) => {
     const { groupId, venueId, shiftId } = event.params;
-    // TEMPORARY — remove before enabling for the live group.
-    // The trigger is bound to a {groupId} wildcard, so a deploy activates it for EVERY
-    // group at once. This guard confines it to the test group while the behaviour is
-    // click-tested — and it deliberately makes the function INERT for all other groups,
-    // INCLUDING the existing role-gated checklist and training blocks below, which ran
-    // group-wide before this conversion. Delete this block (and redeploy) to restore
-    // them and enable the write-trigger group-wide.
-    const RG_SHIFT_TRIGGER_GROUPS = ["YQRkUwBO5wMIdLSgcpji"];
-    if (!RG_SHIFT_TRIGGER_GROUPS.includes(groupId)) return;
+    // Runs for ALL groups (deliberate) — the temporary test-group confinement was removed on release.
     const before = event.data.before.exists ? event.data.before.data() : null;
     const after = event.data.after.exists ? event.data.after.data() : null;
     if (!after) return; // deletion — not handled (unchanged from today)
@@ -3205,12 +3197,7 @@ exports.rgOnStaffWritten = onDocumentWritten(
   },
   async (event) => {
     const { groupId, staffId } = event.params;
-    // TEMPORARY — remove before enabling for the live group.
-    // The trigger is bound to a {groupId} wildcard, so a deploy activates it for EVERY
-    // group at once. This guard confines it to the test group while the behaviour is
-    // click-tested. Delete this block (and redeploy) to enable it group-wide.
-    const RG_STAFF_TRIGGER_GROUPS = ["YQRkUwBO5wMIdLSgcpji"];
-    if (!RG_STAFF_TRIGGER_GROUPS.includes(groupId)) return;
+    // Runs for ALL groups (deliberate) — the temporary test-group confinement was removed on release.
     const before = event.data.before.exists ? event.data.before.data() : null;
     const after = event.data.after.exists ? event.data.after.data() : null;
     if (!after) return null; // deletion — never act
