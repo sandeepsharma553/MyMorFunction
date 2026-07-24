@@ -3271,7 +3271,8 @@ exports.rgRecurringChecklists = onSchedule(
 // (client random-id assigns, shift auto-, scheduler rec-, prior runs): the skip
 // decision is a staffId+itemId field query on the target collection, not just a
 // deterministic-id check; what IS written still uses staff-{itemId}-{staffId} ids so
-// re-runs stay idempotent. SCOPE: all training/SOP modules, but ONLY non-recurring
+// re-runs stay idempotent. SCOPE: all training modules, all SOPs (the decoupled
+// venues/{v}/sops collection → sopAssignments), but ONLY non-recurring
 // checklists — slot-linked (shiftLinks) belong to the shift-slot mechanism, and
 // daily/weekly/fortnightly/monthly belong to the shift trigger / scheduler (no bonus
 // undated copy beside their dated ones). Notifies ONCE per staff member per run — a
@@ -3305,6 +3306,7 @@ exports.rgOnStaffWritten = onDocumentWritten(
     const staff = { id: staffId, ...after };
     const vids = Array.isArray(after.venueIds) ? after.venueIds : [];
     let trainingCreated = 0; // written this run (dup-query skips don't count)
+    let sopCreated = 0;
     let checklistCreated = 0;
     let venuesScanned = 0;
     for (const vid of vids) {
@@ -3340,6 +3342,39 @@ exports.rgOnStaffWritten = onDocumentWritten(
             createdAt: RG_FIELD.serverTimestamp(),
           });
           trainingCreated++;
+        }
+        // SOPs — the DECOUPLED collection (venues/{v}/sops → sopAssignments, Jul 2026
+        // split; the sop flag on trainingModules is legacy display-only). Same gate
+        // (shouldAutoAssign — SOP docs carry cat + autoAssign.stations exactly like
+        // modules), same idempotency rule, same write shape as the client's SOPsPage.
+        const sopSnap = await venueRef.collection("sops").get();
+        for (const d of sopSnap.docs) {
+          const m = d.data();
+          if (!shouldAutoAssign(m, staff, vid)) continue;
+          // idempotent across ALL paths: any existing assignment for this staff+SOP —
+          // client (random addDoc id) or a prior run — means skip.
+          const dup = await venueRef.collection("sopAssignments")
+            .where("staffId", "==", staffId).where("moduleId", "==", d.id).limit(1).get();
+          if (!dup.empty) continue;
+          const aRef = venueRef.collection("sopAssignments").doc(`staff-${d.id}-${staffId}`);
+          await aRef.set({
+            staffId,
+            staffName: after.displayName || after.name || "",
+            venue: m.venue || "",
+            venueId: vid,
+            moduleId: d.id,
+            moduleTitle: m.title || "",
+            due: "",
+            priority: "normal",
+            notes: "",
+            ...rgSnapshotForAssign(m),
+            status: "Not started",
+            progress: 0,
+            auto: true,
+            source: "staff-trigger",
+            createdAt: RG_FIELD.serverTimestamp(),
+          });
+          sopCreated++;
         }
         // checklists — ONLY non-recurring one-offs. Slot-linked (shiftLinks) belong to
         // the shift-slot mechanism; recurring checklists are owned by the shift trigger
@@ -3381,21 +3416,22 @@ exports.rgOnStaffWritten = onDocumentWritten(
     // ONE summary notification per staff member per run — only when something was
     // actually written; a zero-half is omitted from the body. Bare await: rgNotify
     // catches internally, so this can never throw out of the handler.
-    const created = trainingCreated + checklistCreated;
+    const created = trainingCreated + sopCreated + checklistCreated;
     if (created) {
       const parts = [];
       if (trainingCreated) parts.push(`${trainingCreated} training item${trainingCreated === 1 ? "" : "s"}`);
+      if (sopCreated) parts.push(`${sopCreated} SOP${sopCreated === 1 ? "" : "s"}`);
       if (checklistCreated) parts.push(`${checklistCreated} checklist${checklistCreated === 1 ? "" : "s"}`);
       await rgNotify(groupId, {
         to: staffId,
-        type: trainingCreated ? "training" : "checklist", // house types from the shift trigger
+        type: trainingCreated ? "training" : sopCreated ? "sop" : "checklist", // house types from the shift trigger + the SOPs split
         title: "New items assigned",
         body: `${parts.join(" and ")} assigned to you`,
         venueId: vids[0] || "",
         by: "Auto-assign",
       });
     }
-    console.log(`[rgOnStaffWritten] ${groupId}/${staffId} done: reason=${reason} venues=${venuesScanned} training=${trainingCreated} checklists=${checklistCreated}`);
+    console.log(`[rgOnStaffWritten] ${groupId}/${staffId} done: reason=${reason} venues=${venuesScanned} training=${trainingCreated} sops=${sopCreated} checklists=${checklistCreated}`);
     return null;
   }
 );
