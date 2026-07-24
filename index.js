@@ -3272,10 +3272,11 @@ exports.rgRecurringChecklists = onSchedule(
 // decision is a staffId+itemId field query on the target collection, not just a
 // deterministic-id check; what IS written still uses staff-{itemId}-{staffId} ids so
 // re-runs stay idempotent. SCOPE: all training modules, all SOPs (the decoupled
-// venues/{v}/sops collection → sopAssignments), but ONLY non-recurring
-// checklists — slot-linked (shiftLinks) belong to the shift-slot mechanism, and
-// daily/weekly/fortnightly/monthly belong to the shift trigger / scheduler (no bonus
-// undated copy beside their dated ones). Notifies ONCE per staff member per run — a
+// venues/{v}/sops collection → sopAssignments), and all checklists EXCEPT
+// slot-linked ones (shiftLinks — the shift-slot mechanism owns those). Recurring
+// checklists assign a STANDING copy at hire/station-change (owner ruling Jul 2026 —
+// same undated doc the manual assign path writes); the dup gate stops stacking onto
+// shift-trigger/scheduler copies. Notifies ONCE per staff member per run — a
 // single rgNotify summary after the scan, only when something was actually written
 // (rgNotify swallows its own errors, so notify can never abort the handler; assignments
 // never depend on notify). The scan gate keeps phone/name-only edits free. Deletions do
@@ -3376,17 +3377,18 @@ exports.rgOnStaffWritten = onDocumentWritten(
           });
           sopCreated++;
         }
-        // checklists — ONLY non-recurring one-offs. Slot-linked (shiftLinks) belong to
-        // the shift-slot mechanism; recurring checklists are owned by the shift trigger
-        // (daily) / scheduler (weekly, monthly) — the staff trigger must not write a
-        // lone undated copy beside their dated ones. Fortnightly currently has no
-        // scheduler branch, so it is intentionally unsupported here rather than
-        // half-assigned via this path.
+        // checklists — every station/role-targeted checklist EXCEPT slot-linked ones
+        // (shiftLinks belong to the shift-slot mechanism; their assignment follows the
+        // shift). Owner ruling Jul 2026: recurring checklists now ALSO assign a standing
+        // copy at hire / station change — the same undated doc the manual "+ Assign
+        // checklist" path and the editors' save-time auto-assign create — so a new hire
+        // sees their station's checklists immediately instead of waiting for a roster
+        // write. The dup gate below (any staffId+checklistId doc, dated or not) keeps
+        // this from stacking onto shift-trigger/scheduler copies the person already has.
         const clSnap = await venueRef.collection("checklists").get();
         for (const d of clSnap.docs) {
           const c = d.data();
           if (Array.isArray(c.shiftLinks) && c.shiftLinks.length) continue;
-          if (["daily", "weekly", "fortnightly", "monthly"].includes(String(c.frequency || "").toLowerCase())) continue;
           if (!shouldAutoAssign(c, staff, vid)) continue;
           // idempotent across ALL paths — same field-query rule as training.
           const dup = await venueRef.collection("checklistAssignments")
